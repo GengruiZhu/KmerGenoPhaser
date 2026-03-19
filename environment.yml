@@ -1,0 +1,46 @@
+name: kmer
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # ── Python ────────────────────────────────────────────────────────────────
+  - python=3.9
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - networkx
+  - biopython
+  - pip
+  - pip:
+      - torch==2.6.0
+      - torchaudio==2.6.0
+      - torchvision==0.21.0
+  # cyvcf2 via bioconda (needed for snpml module only)
+  - bioconda::cyvcf2
+
+  # ── R ─────────────────────────────────────────────────────────────────────
+  - r-base=4.2
+  - r-tidyverse
+  - r-dplyr
+  - r-ggplot2
+  - r-tidyr
+  - r-stringr
+  - r-patchwork
+  - r-ggrepel
+  - r-data.table
+  - r-fs
+  - r-showtext      # optional: Chinese font support
+
+  # ── System tools ──────────────────────────────────────────────────────────
+  - bioconda::kmc
+  - bioconda::samtools
+  - bioconda::bcftools
+  - bioconda::tabix
+  - bioconda::htslib   # provides bgzip
+
+  # ── Fix libcrypto issue common with htslib tools ─────────────────────────
+  - openssl=1.1

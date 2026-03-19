@@ -1,0 +1,75 @@
+# =============================================================================
+# KmerGenoPhaser.gitignore
+# =============================================================================
+
+# ── Pipeline outputs (never commit these) ────────────────────────────────────
+output/
+process/
+results/
+work/
+logs/
+*.log
+
+# ── Large data files ─────────────────────────────────────────────────────────
+*.fasta
+*.fa
+*.fq
+*.fastq
+*.fq.gz
+*.fastq.gz
+*.bam
+*.bai
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.bed
+*.bedGraph
+*.tsv
+*.csv
+!test/data/*.fasta    # allow tiny test fastas
+!test/data/*.tsv      # allow tiny test tables
+!test/data/*.vcf      # allow tiny test VCFs
+
+# ── Intermediate files ───────────────────────────────────────────────────────
+*.pkl
+*.kmc_pre
+*.kmc_suf
+*.tmp
+tmp/
+temp/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.Python
+
+# ── R ────────────────────────────────────────────────────────────────────────
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# ── OS / Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Conda ────────────────────────────────────────────────────────────────────
+# Don't commit the environment itself, only environment.yml
+.conda/
+
+# Large test data
+test/data/ad_matrices/
+test/data/reads/

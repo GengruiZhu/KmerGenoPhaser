@@ -1,0 +1,369 @@
+#!/bin/bash
+# =============================================================================
+# KmerGenoPhaser — main dispatcher
+# Lives at:  KmerGenoPhaser/bin/KmerGenoPhaser
+# Symlinked: $CONDA_PREFIX/bin/KmerGenoPhaser  (created by install.sh)
+# =============================================================================
+set -euo pipefail
+
+VERSION="1.0.0"
+
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"    # .../KmerGenoPhaser/bin/
+PKG_ROOT="$(dirname "$SCRIPT_DIR")"       # .../KmerGenoPhaser/
+BIN_DIR="${PKG_ROOT}/bin"
+LIB_DIR="${PKG_ROOT}/lib"
+
+# =============================================================================
+# usage
+# =============================================================================
+usage() {
+cat <<EOF
+KmerGenoPhaser v${VERSION}
+Ancestry block phasing toolkit for allopolyploid genomes.
+
+Usage:
+  KmerGenoPhaser <command> [options]
+  KmerGenoPhaser --help | --version
+
+Commands:
+  supervised      K-mer specificity scoring + genome mapping + block output
+  unsupervised    Autoencoder-based ancestry block discovery + karyotype
+  snpml           SNP + Maximum-Likelihood ancestry block calling
+  karyotype       Idiogram karyotype visualization (standalone)
+  build-inputs    Auto-generate genome.size and group list files from data
+
+Aliases:  sup / unsup / snp  (short forms accepted for the three main modules)
+
+Quick help per command:
+  KmerGenoPhaser supervised    --help
+  KmerGenoPhaser unsupervised  --help
+  KmerGenoPhaser snpml         --help
+  KmerGenoPhaser karyotype     --help
+  KmerGenoPhaser build-inputs  --help
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Typical workflow
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  # Step 0 — generate metadata files from your data
+  KmerGenoPhaser build-inputs \\
+      --fasta          genome.fasta \\
+      --ad_matrix      Chr1A_AD_matrix.txt \\
+      --group_patterns "Ssp,Sof,Sro" \\
+      --output_dir     test/data
+
+  # Step A — k-mer based (FASTA or FASTQ ancestor data)
+  KmerGenoPhaser supervised \\
+      --target_genome  genome.fasta \\
+      --species_names  "SES208,B48" \\
+      --read_dirs      "/data/SES208:/data/B48" \\
+      --read_format    fa \\
+      --work_dir       work/supervised
+
+  # Step B — SNP + ML (use existing bedGraphs with --existing_diag_dir)
+  KmerGenoPhaser snpml \\
+      --vcf            /dev/null \\
+      --ad_matrix_dir  test/data/ad_matrices \\
+      --group_names    "Spontaneum,Officinarum,Robustum" \\
+      --group_patterns "Ssp,Sof,Sro" \\
+      --group_lists    "test/data/group_lists/Ssp.txt:test/data/group_lists/Sof.txt:test/data/group_lists/Sro.txt" \\
+      --target_samples "XTT.1.g" \\
+      --sample_names   "Ssp.1.g,...,XTT.1.g" \\
+      --chrom_sizes    test/data/genome.size \\
+      --work_dir       work/snpml \\
+      --skip_diag \\
+      --existing_diag_dir test/data/diag_bedgraph
+
+  # Step C — autoencoder (feed blocks from Step A or B)
+  KmerGenoPhaser unsupervised \\
+      --input_fasta   genome.fasta \\
+      --species_name  MySpecies_Chr1 \\
+      --target_chroms "Chr1A Chr1B Chr1D" \\
+      --block_dir     work/snpml/output/snpml_block_txt/XTT.1.g \\
+      --work_dir      work/unsupervised
+
+  # Step D — karyotype (standalone, or auto-run at end of unsupervised)
+  KmerGenoPhaser karyotype \\
+      --input_dir     work/unsupervised/output/bloodline/MySpecies/updated_blocks \\
+      --output_dir    work/karyotype \\
+      --genome_title  "MySpecies"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Config file (all defaults, overridable by CLI):
+  ${PKG_ROOT}/conf/kmergenophaser.conf
+
+Package root:
+  ${PKG_ROOT}
+EOF
+exit 0
+}
+
+# =============================================================================
+# build-inputs subcommand (inline — no separate script file needed)
+# =============================================================================
+cmd_build_inputs() {
+  # ── defaults ────────────────────────────────────────────────────────────────
+  local FASTA="" AD_MATRIX="" GROUP_PATTERNS="" OUTPUT_DIR="." FAI=""
+
+  # ── usage ───────────────────────────────────────────────────────────────────
+  local usage_bi
+  usage_bi() {
+cat <<EOF
+Usage: KmerGenoPhaser build-inputs [options]
+
+Actions (at least one required):
+  --fasta          <path>   Generate <basename>.size from FASTA
+                            (requires samtools; uses existing .fai if present)
+  --ad_matrix      <path>   Generate group list files from AD matrix columns
+  --group_patterns <str>    Grep patterns for group assignment (comma-separated)
+                            Required with --ad_matrix
+                            e.g. "Ssp,Sof,Sro"  or  "ParentA,ParentB"
+
+Options:
+  --output_dir     <path>   Where to write output files  (default: .)
+  --fai            <path>   Use an existing .fai index instead of running faidx
+
+Output files:
+  <basename>.size           Two-column TSV:  chrom_name  length_bp
+  group_lists/<pat>.txt     One sample name per line, per group pattern
+
+Prints to stdout:
+  Ready-to-paste --sample_names, --group_lists, --target_samples strings
+
+Examples:
+  # Generate genome size file only
+  KmerGenoPhaser build-inputs \\
+      --fasta      test/data/genome.fasta \\
+      --output_dir test/data
+
+  # Generate group lists only
+  KmerGenoPhaser build-inputs \\
+      --ad_matrix      test/data/ad_matrices/Chr1A_AD_matrix.txt \\
+      --group_patterns "Ssp,Sof,Sro" \\
+      --output_dir     test/data
+
+  # Both at once
+  KmerGenoPhaser build-inputs \\
+      --fasta          test/data/genome.fasta \\
+      --ad_matrix      test/data/ad_matrices/Chr1A_AD_matrix.txt \\
+      --group_patterns "Ssp,Sof,Sro" \\
+      --output_dir     test/data
+EOF
+    exit 0
+  }
+
+  # ── parse ────────────────────────────────────────────────────────────────────
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fasta)           FASTA="$2";          shift 2 ;;
+      --ad_matrix)       AD_MATRIX="$2";      shift 2 ;;
+      --group_patterns)  GROUP_PATTERNS="$2"; shift 2 ;;
+      --output_dir)      OUTPUT_DIR="$2";     shift 2 ;;
+      --fai)             FAI="$2";            shift 2 ;;
+      -h|--help)         usage_bi ;;
+      *) echo "[WARN] Unknown argument: $1"; shift ;;
+    esac
+  done
+
+  [[ -z "$FASTA" && -z "$AD_MATRIX" ]] && {
+    echo "[ERROR] Provide --fasta and/or --ad_matrix."
+    echo "        Run: KmerGenoPhaser build-inputs --help"
+    exit 1
+  }
+  [[ -n "$AD_MATRIX" && -z "$GROUP_PATTERNS" ]] && {
+    echo "[ERROR] --group_patterns required with --ad_matrix."
+    echo "        Run: KmerGenoPhaser build-inputs --help"
+    exit 1
+  }
+
+  mkdir -p "$OUTPUT_DIR"
+
+  # ── 1. genome size file ───────────────────────────────────────────────────
+  if [[ -n "$FASTA" ]]; then
+    echo ""
+    echo "=== Generating genome size file ==="
+    [[ ! -f "$FASTA" ]] && { echo "[ERROR] FASTA not found: $FASTA"; exit 1; }
+
+    local BASE
+    BASE="$(basename "$FASTA")"
+    BASE="${BASE%.gz}"; BASE="${BASE%.fasta}"; BASE="${BASE%.fa}"
+    local SIZE_FILE="${OUTPUT_DIR}/${BASE}.size"
+
+    local FAI_FILE=""
+    if [[ -n "$FAI" && -f "$FAI" ]]; then
+      FAI_FILE="$FAI"
+      echo "  Using provided .fai: $FAI_FILE"
+    elif [[ -f "${FASTA}.fai" ]]; then
+      FAI_FILE="${FASTA}.fai"
+      echo "  Using existing .fai: $FAI_FILE"
+    else
+      if ! command -v samtools &>/dev/null; then
+        echo "[ERROR] samtools not found. Install it or provide --fai."
+        echo "  Manual alternative:"
+        echo "    samtools faidx $FASTA"
+        echo "    cut -f1,2 ${FASTA}.fai > $SIZE_FILE"
+        exit 1
+      fi
+      echo "  Running: samtools faidx $FASTA"
+      samtools faidx "$FASTA"
+      FAI_FILE="${FASTA}.fai"
+    fi
+
+    cut -f1,2 "$FAI_FILE" > "$SIZE_FILE"
+    echo "  Written: $SIZE_FILE"
+    echo "  Contents:"
+    cat "$SIZE_FILE" | sed 's/^/    /'
+  fi
+
+  # ── 2. group list files from AD matrix ────────────────────────────────────
+  if [[ -n "$AD_MATRIX" ]]; then
+    echo ""
+    echo "=== Generating group list files from AD matrix ==="
+    [[ ! -f "$AD_MATRIX" ]] && { echo "[ERROR] AD matrix not found: $AD_MATRIX"; exit 1; }
+
+    local GROUP_LIST_DIR="${OUTPUT_DIR}/group_lists"
+    mkdir -p "$GROUP_LIST_DIR"
+
+    # Parse header columns 5+ and clean: [5]Ssp.1.g:AD → Ssp.1.g
+    local CLEAN_NAMES
+    CLEAN_NAMES=$(head -1 "$AD_MATRIX" | cut -f5- | tr '\t' '\n' | \
+      sed 's/^\[[0-9]*\]//; s/:AD$//' | grep -v '^$')
+
+    local ALL_CLEAN
+    ALL_CLEAN=$(echo "$CLEAN_NAMES" | tr '\n' ',' | sed 's/,$//')
+    local TOTAL
+    TOTAL=$(echo "$CLEAN_NAMES" | grep -c '.')
+    echo "  Total samples found: $TOTAL"
+    echo ""
+
+    IFS=',' read -ra PAT_ARR <<< "$GROUP_PATTERNS"
+    declare -A ASSIGNED_MAP
+
+    for PAT in "${PAT_ARR[@]}"; do
+      local OUT_FILE="${GROUP_LIST_DIR}/${PAT}.txt"
+      local COUNT=0
+      > "$OUT_FILE"
+      while IFS= read -r SAMPLE; do
+        if echo "$SAMPLE" | grep -q "$PAT"; then
+          echo "$SAMPLE" >> "$OUT_FILE"
+          ASSIGNED_MAP["$SAMPLE"]=1
+          COUNT=$((COUNT+1))
+        fi
+      done <<< "$CLEAN_NAMES"
+      echo "  Written: $OUT_FILE  ($COUNT samples)"
+      [[ "$COUNT" -eq 0 ]] && \
+        echo "  [WARN] Pattern '$PAT' matched nothing — check --group_patterns"
+    done
+
+    # Unassigned = target samples
+    local UNASSIGNED=()
+    while IFS= read -r SAMPLE; do
+      [[ -z "${ASSIGNED_MAP[$SAMPLE]+_}" ]] && UNASSIGNED+=("$SAMPLE")
+    done <<< "$CLEAN_NAMES"
+
+    # Build output strings
+    local GLIST_PATHS=()
+    for PAT in "${PAT_ARR[@]}"; do
+      GLIST_PATHS+=("${GROUP_LIST_DIR}/${PAT}.txt")
+    done
+    local GLIST_STR
+    GLIST_STR=$(IFS=':'; echo "${GLIST_PATHS[*]}")
+
+    echo ""
+    echo "================================================================"
+    echo "  Ready-to-paste strings for: KmerGenoPhaser snpml"
+    echo ""
+    echo "  --sample_names \\"
+    echo "      \"${ALL_CLEAN}\""
+    echo ""
+    echo "  --group_lists \\"
+    echo "      \"${GLIST_STR}\""
+    if [[ ${#UNASSIGNED[@]} -gt 0 ]]; then
+      local TGT_STR
+      TGT_STR=$(IFS=','; echo "${UNASSIGNED[*]}")
+      echo ""
+      echo "  --target_samples \\"
+      echo "      \"${TGT_STR}\""
+      echo ""
+      echo "  (Unassigned samples above are likely your target/hybrid samples)"
+    fi
+    echo "================================================================"
+  fi
+
+  echo ""
+  echo "build-inputs complete."
+}
+
+# =============================================================================
+# karyotype subcommand (thin wrapper around vis_karyotype.R)
+# =============================================================================
+cmd_karyotype() {
+  if [[ $# -eq 0 || "$1" == "--help" || "$1" == "-h" ]]; then
+    Rscript "${LIB_DIR}/vis_karyotype.R" --help 2>/dev/null || \
+    cat <<EOF
+Usage: KmerGenoPhaser karyotype [options]
+
+Thin wrapper around lib/vis_karyotype.R.
+
+Required:
+  --input_dir      <path>   Block .txt directory (from unsupervised updated_blocks/)
+  --output_dir     <path>   Output directory for PDF karyotype plots
+
+Optional:
+  --genome_title   <str>    Title prefix  (default: Target)
+  --centromere_file <path>  Centromere CSV: Chrom,Centromere_Start_Mb,Centromere_End_Mb
+  --bloodline_colors <str>  "Name=#hex,Name2=#hex2" custom color map
+  --chrom_pattern  <regex>  Individual chrom name pattern  (default: Chr[0-9]+[A-Za-z]?)
+  --group_pattern  <regex>  Homologous group pattern       (default: Chr[0-9]+)
+  --inferred_alpha <float>  Lightness for Inferred_ colors (default: 0.55)
+
+Example:
+  KmerGenoPhaser karyotype \\
+      --input_dir    work/unsupervised/output/bloodline/MySpecies/updated_blocks \\
+      --output_dir   work/karyotype \\
+      --genome_title "MySpecies" \\
+      --centromere_file test/data/centromeres.csv
+EOF
+    exit 0
+  fi
+
+  exec Rscript "${LIB_DIR}/vis_karyotype.R" "$@"
+}
+
+# =============================================================================
+# Main dispatch
+# =============================================================================
+[[ $# -eq 0 ]] && usage
+
+case "$1" in
+  --help|-h|help)       usage ;;
+  --version|-v|version) echo "KmerGenoPhaser v${VERSION}"; exit 0 ;;
+
+  supervised|sup)
+    shift
+    exec "${BIN_DIR}/KmerGenoPhaser_supervised.sh" "$@"
+    ;;
+  unsupervised|unsup)
+    shift
+    exec "${BIN_DIR}/KmerGenoPhaser_unsupervised.sh" "$@"
+    ;;
+  snpml|snp)
+    shift
+    exec "${BIN_DIR}/KmerGenoPhaser_snpml.sh" "$@"
+    ;;
+  karyotype|karyo)
+    shift
+    cmd_karyotype "$@"
+    ;;
+  build-inputs|build)
+    shift
+    cmd_build_inputs "$@"
+    ;;
+  *)
+    echo "[ERROR] Unknown command: '$1'"
+    echo "        Valid: supervised | unsupervised | snpml | karyotype | build-inputs"
+    echo "        Run:   KmerGenoPhaser --help"
+    exit 1
+    ;;
+esac
