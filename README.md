@@ -502,3 +502,9 @@ KmerGenoPhaser karyotype \
 ## License
 
 MIT
+
+---
+## Contact
+
+- **Developers**: Gengrui Zhu, Yi Chen
+- **Issues**: please use the [GitHub Issues](https://github.com/GengruiZhu/KmerGenoPhaser/issues) page for bug reports and questions.
