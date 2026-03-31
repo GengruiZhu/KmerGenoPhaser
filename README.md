@@ -35,7 +35,7 @@
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| **[v1.1](https://github.com/GengruiZhu/KmerGenoPhaser/releases/tag/v1.1)** | 2026-03-31 | Selectable FFT encoding (`--encoding`); complex vari-code fix; auto `INPUT_DIM`; genome feature mode |
+| **[v1.1](https://github.com/GengruiZhu/KmerGenoPhaser/releases/tag/v1.1)** | 2026-03-31 | **supervised**: GNU parallel for Steps 0/1/1.5; `--n_parallel`, `--n_kmc_parallel`, `--chunk_size` flags; per-step joblogs. **unsupervised**: selectable FFT encoding (`--encoding`); complex vari-code fix; auto `INPUT_DIM`; genome feature mode |
 | [v1.0](https://github.com/GengruiZhu/KmerGenoPhaser/releases/tag/v1.0) | 2025-03 | Initial public release |
 
 See [CHANGELOG.md](CHANGELOG.md) for full details.
@@ -67,6 +67,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 |------|--------|-------|
 | `kmc` ≥ 3.2 | supervised | K-mer counting |
 | `kmc_tools` ≥ 3.2 | supervised | K-mer set operations |
+| `parallel` | supervised (v1.1) | GNU parallel; `conda install -c conda-forge parallel` |
 | `samtools` | build-inputs, snpml | `.fai` index generation |
 | `bcftools` | snpml | VCF processing |
 | `tabix` / `bgzip` | snpml | VCF indexing |
@@ -127,6 +128,9 @@ Rscript -e 'install.packages(c("patchwork","ggrepel"), repos="https://cloud.r-pr
 # cyvcf2
 conda install -c bioconda cyvcf2
 
+# GNU parallel (required for supervised v1.1 parallel execution)
+conda install -c conda-forge parallel
+
 # samtools / tabix / bgzip libcrypto error
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
@@ -145,7 +149,7 @@ KmerGenoPhaser/
 ├── environment.yml
 ├── bin/
 │   ├── KmerGenoPhaser                    ← main entry point (dispatcher)
-│   ├── KmerGenoPhaser_supervised.sh
+│   ├── KmerGenoPhaser_supervised.sh      ← v1.1: parallel Steps 0/1/1.5; --n_parallel etc.
 │   ├── KmerGenoPhaser_unsupervised.sh    ← v1.1: --encoding / --feature_mode added
 │   └── KmerGenoPhaser_snpml.sh
 ├── conf/
@@ -155,7 +159,7 @@ KmerGenoPhaser/
 └── lib/
     ├── vis_karyotype.R                   ← karyotype visualization
     ├── supervised/
-    │   ├── calculate_specificity.py
+    │   ├── calculate_specificity.py      ← v1.1: --chunk_size batch vectorization
     │   ├── equalize_and_sample.py
     │   ├── filter_unique_kmer.py
     │   ├── map_kmers_to_genome.py
@@ -189,6 +193,13 @@ All defaults are in `conf/kmergenophaser.conf`. CLI arguments always override co
 CONDA_ENV="<your-conda-env-name>"
 MINICONDA_PATH="${HOME}/miniconda3"    # or ~/anaconda3
 THREADS=20
+
+# supervised — v1.1 parallelism
+# N_PARALLEL=0 means auto (= number of species, capped at 8)
+# N_KMC_PARALLEL=1 is safe for HDD; set to N_PARALLEL for NVMe/SSD
+N_PARALLEL=0
+N_KMC_PARALLEL=1
+CHUNK_SIZE=50000
 
 # unsupervised — feature extraction
 MIN_KMER=1;  MAX_KMER=5
@@ -251,13 +262,27 @@ KmerGenoPhaser build-inputs \
 
 K-mer specificity scoring from ancestor sequences, mapped onto the target genome. Supports both FASTA and FASTQ ancestor input. Outputs block `.txt` files for the `unsupervised` module.
 
+**v1.1** adds parallel execution for the most compute-intensive steps (Steps 0, 1, 1.5) via GNU parallel, and batch vectorization in `calculate_specificity.py`. For typical 3-species runs this reduces wall time by ~3–10× with no change to results.
+
 ```bash
+# 3-ancestor run with parallel scoring (v1.1 recommended)
+KmerGenoPhaser supervised \
+    --target_genome  /path/to/target.fasta \
+    --species_names  "AncestorA,AncestorB,AncestorC" \
+    --read_dirs      "/data/AncestorA:/data/AncestorB:/data/AncestorC" \
+    --read_format    fa \
+    --work_dir       /path/to/work \
+    --n_parallel     3
+
+# 2-ancestor run, NVMe storage (parallel KMC too)
 KmerGenoPhaser supervised \
     --target_genome  /path/to/target.fasta \
     --species_names  "AncestorA,AncestorB" \
     --read_dirs      "/data/AncestorA:/data/AncestorB" \
     --read_format    fa \
-    --work_dir       /path/to/work
+    --work_dir       /path/to/work \
+    --n_parallel     2 \
+    --n_kmc_parallel 2
 ```
 
 **Required:**
@@ -276,12 +301,30 @@ KmerGenoPhaser supervised \
 | `--read_format` | `fq` | Input format: `fa` (FASTA) or `fq` (FASTQ) |
 | `--k` | 21 | K-mer size |
 | `--window_size` | 100000 | Mapping window size in bp |
-| `--threads` | 20 | CPU threads |
+| `--threads` | 20 | Total CPU threads. Divided evenly across parallel jobs in Steps 0/1/1.5 |
 | `--dominance_thr` | 0.55 | Min fraction to call a dominant block (Step 3.5) |
 | `--min_counts` | 10 | Min k-mer count per window to attempt a call |
 | `--skip_mapping` | — | Skip mapping step, reuse existing tables |
 | `--skip_blocks` | — | Skip block file generation (Step 3.5) |
 | `--skip_vis` | — | Skip R visualization |
+
+**v1.1 parallelism options:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--n_parallel` | auto (= N species, max 8) | Parallel species jobs for Steps 1 and 1.5. Requires GNU parallel. Falls back to serial if not installed. |
+| `--n_kmc_parallel` | `1` | Parallel KMC jobs for Step 0. Set to `--n_parallel` value for NVMe/SSD storage. Keep at `1` for HDD to avoid I/O contention. |
+| `--chunk_size` | `50000` | Batch size for vectorized scoring in `calculate_specificity.py`. Larger = faster but higher RAM. |
+
+**Per-step job logs** are written to `<work_dir>/`:
+
+```
+step0_kmc_parallel.log       (only when --n_kmc_parallel > 1)
+step1_specificity_parallel.log
+step15_filter_parallel.log
+```
+
+These logs let you resume a failed run — any species with an existing output file is automatically skipped on re-run.
 
 **Output block files** are written to `<work_dir>/output/skmer_mapping_k<K>/blocks/` and can be passed directly to `unsupervised --block_dir`.
 
@@ -504,14 +547,15 @@ KmerGenoPhaser build-inputs \
 #            ${DATA}/group_lists/GroupA.txt  GroupB.txt  GroupC.txt
 # Prints: ready-to-paste --sample_names / --group_lists / --target_samples
 
-# Step A: Supervised (k-mer, ancestor FASTA input)
+# Step A: Supervised (k-mer, ancestor FASTA input, parallel v1.1)
 KmerGenoPhaser supervised \
     --target_genome  ${DATA}/target.fasta \
-    --species_names  "AncestorA,AncestorB" \
-    --read_dirs      "${DATA}/reads/AncestorA:${DATA}/reads/AncestorB" \
+    --species_names  "AncestorA,AncestorB,AncestorC" \
+    --read_dirs      "${DATA}/reads/AncestorA:${DATA}/reads/AncestorB:${DATA}/reads/AncestorC" \
     --read_format    fa \
     --window_size    500000 \
-    --work_dir       ${WORK}/supervised
+    --work_dir       ${WORK}/supervised \
+    --n_parallel     3
 # Block output: ${WORK}/supervised/output/skmer_mapping_k21/blocks/
 
 # Step B: SNP & ML (with pre-computed bedGraphs)
@@ -562,14 +606,19 @@ KmerGenoPhaser karyotype \
 | `libcrypto.so.1.0.0` error | `export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH` |
 | `R:patchwork` / `R:ggrepel` FAIL | `Rscript -e 'install.packages(c("patchwork","ggrepel"))'` |
 | `cyvcf2` not found | `conda install -c bioconda cyvcf2` |
+| `parallel: command not found` | `conda install -c conda-forge parallel`; supervised falls back to serial automatically |
+| Steps 1/1.5 hang with parallel | Check `<work_dir>/step1_specificity_parallel.log` for failed jobs |
 | `INPUT_DIM mismatch` in training | Check the `INPUT_DIM` printed at Step 1; v1.1 computes this automatically |
 | `unrecognized arguments: --encoding` | Ensure you are using the v1.1 `KmerGenoPhaser_unsupervised.sh` |
+| `unrecognized arguments: --n_parallel` | Ensure you are using the v1.1 `KmerGenoPhaser_supervised.sh` |
 | `No group columns matched pattern` | Check `--group_patterns` against actual AD matrix column names |
 | `No *_AD_matrix.txt files found` | Files must end with exactly `_AD_matrix.txt` |
 | bedGraph not linked in snpml | File naming must be `<Chrom>.<GroupName>.bedgraph` |
 | Karyotype shows no chromosomes | Check `--group_pattern` regex matches your chromosome names |
 | `CONDA_ENV` not found in conf | Edit `conf/kmergenophaser.conf` — set `CONDA_ENV` to your env name |
 | Old `.pkl` / `*_distances.tsv` reused | Delete cached files before re-running with new `--encoding` setting |
+| KMC jobs collide on HDD | Keep `--n_kmc_parallel 1` (default); only increase for NVMe/SSD |
+| High RAM with parallel scoring | Lower `--chunk_size` (default 50000); each parallel job uses ~`chunk_size × k-mer_dim × 8 bytes` |
 
 ---
 

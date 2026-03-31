@@ -13,22 +13,31 @@
 #   Step 3.5→ mapping_counts_to_blocks.py (counts TSV → block .txt files)
 #   Step 4  → vis_supervised.R           (visualization)
 #
+# v1.1 changes:
+#   - Steps 0, 1, 1.5 now run species in parallel via GNU parallel
+#   - New --n_parallel / --n_kmc_parallel flags to control concurrency
+#   - New --chunk_size flag passed to calculate_specificity.py (batch vectorization)
+#   - Per-step joblog written to WORK_DIR for resume / audit
+#
 # Examples:
-#   # Sugarcane (ancestor FASTA files)
+#   # Sugarcane (ancestor FASTA files, parallel scoring)
 #   KmerGenoPhaser supervised \
 #       --target_genome XTT22_Chr1A.fasta \
 #       --species_names "SES208,B48" \
 #       --read_dirs     "/data/SES208:/data/B48" \
 #       --read_format   fa \
-#       --work_dir      /path/to/work
+#       --work_dir      /path/to/work \
+#       --n_parallel    2
 #
-#   # Wheat (FASTQ reads, 3 ancestors)
+#   # Wheat (FASTQ reads, 3 ancestors, NVMe storage)
 #   KmerGenoPhaser supervised \
 #       --target_genome wheat.fasta \
 #       --species_names "AA,BB,DD" \
 #       --read_dirs     "/data/Turartu:/data/Speltoides:/data/Tauschii" \
 #       --read_format   fq \
-#       --work_dir      /path/to/work
+#       --work_dir      /path/to/work \
+#       --n_parallel    3 \
+#       --n_kmc_parallel 3
 # =============================================================================
 set -euo pipefail
 
@@ -56,10 +65,23 @@ Optional — input format:
                             fa: reads *.fa / *.fasta / *.fa.gz / *.fasta.gz
                             fq: reads *.fq / *.fastq / *.fq.gz / *.fastq.gz
 
+Optional — parallelism (v1.1):
+  --n_parallel     <int>    Number of species to process in parallel for
+                            Steps 1 and 1.5 (default: number of species, max 8)
+                            Requires GNU parallel (conda install -c conda-forge parallel)
+  --n_kmc_parallel <int>    Number of species to run KMC on simultaneously
+                            in Step 0. Default: 1 (safe for HDD).
+                            Set to --n_parallel value for NVMe/SSD storage.
+  --chunk_size     <int>    Batch size for vectorized k-mer scoring in
+                            calculate_specificity.py (default: 50000)
+                            Larger values are faster but use more RAM.
+
 Optional — k-mer pipeline:
   --config         <path>   Config file (default: ${DEFAULT_CONF})
   --k              <int>    K-mer size (default: 21)
-  --threads        <int>    CPU threads (default: 20)
+  --threads        <int>    CPU threads total (default: 20).
+                            When --n_parallel > 1, threads are divided evenly
+                            across parallel species jobs.
   --min_count      <int>    Min k-mer abundance for KMC (default: 50)
   --min_score      <float>  Min specificity score (default: 0.9)
   --top_pct        <float>  Initial top-% filter (default: 0.5)
@@ -99,35 +121,40 @@ SKIP_MAPPING=0; SKIP_BLOCKS=0; SKIP_VIS=0
 DOMINANCE_THR="0.55"; MIN_COUNTS="10"
 SPECIES_COLORS=""; SPECIES_COLS=""; GENOME_TITLE=""
 BLOCK_FILE=""; DOMINANCE_VIS="0.55"; LANG="en"; NCOLS="6"
+# v1.1 parallel defaults (0 means "auto" = set after parsing species count)
+N_PARALLEL=0; N_KMC_PARALLEL=1; CHUNK_SIZE=50000
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --target_genome)  TARGET_GENOME="$2";       shift 2 ;;
-    --species_names)  SPECIES_NAMES="$2";       shift 2 ;;
-    --read_dirs)      READ_DIRS="$2";           shift 2 ;;
-    --work_dir)       WORK_DIR="$2";            shift 2 ;;
-    --config)         CONFIG="$2";              shift 2 ;;
-    --read_format)    READ_FORMAT="$2";         shift 2 ;;
-    --k)              OVERRIDE_K="$2";          shift 2 ;;
-    --threads)        OVERRIDE_THREADS="$2";    shift 2 ;;
-    --min_count)      OVERRIDE_MIN_COUNT="$2";  shift 2 ;;
-    --min_score)      OVERRIDE_MIN_SCORE="$2";  shift 2 ;;
-    --top_pct)        OVERRIDE_TOP_PCT="$2";    shift 2 ;;
-    --kmc_memory)     OVERRIDE_KMC_MEM="$2";    shift 2 ;;
-    --window_size)    OVERRIDE_WINDOW_SIZE="$2"; shift 2 ;;
-    --skip_mapping)   SKIP_MAPPING=1;           shift ;;
-    --skip_blocks)    SKIP_BLOCKS=1;            shift ;;
-    --skip_vis)       SKIP_VIS=1;               shift ;;
-    --dominance_thr)  DOMINANCE_THR="$2";       shift 2 ;;
-    --min_counts)     MIN_COUNTS="$2";          shift 2 ;;
-    --species_colors) SPECIES_COLORS="$2";      shift 2 ;;
-    --species_cols)   SPECIES_COLS="$2";        shift 2 ;;
-    --genome_title)   GENOME_TITLE="$2";        shift 2 ;;
-    --block_file)     BLOCK_FILE="$2";          shift 2 ;;
-    --dominance_vis)  DOMINANCE_VIS="$2";       shift 2 ;;
-    --lang)           LANG="$2";               shift 2 ;;
-    --ncols)          NCOLS="$2";              shift 2 ;;
-    -h|--help)        usage ;;
+    --target_genome)   TARGET_GENOME="$2";        shift 2 ;;
+    --species_names)   SPECIES_NAMES="$2";        shift 2 ;;
+    --read_dirs)       READ_DIRS="$2";            shift 2 ;;
+    --work_dir)        WORK_DIR="$2";             shift 2 ;;
+    --config)          CONFIG="$2";               shift 2 ;;
+    --read_format)     READ_FORMAT="$2";          shift 2 ;;
+    --k)               OVERRIDE_K="$2";           shift 2 ;;
+    --threads)         OVERRIDE_THREADS="$2";     shift 2 ;;
+    --min_count)       OVERRIDE_MIN_COUNT="$2";   shift 2 ;;
+    --min_score)       OVERRIDE_MIN_SCORE="$2";   shift 2 ;;
+    --top_pct)         OVERRIDE_TOP_PCT="$2";     shift 2 ;;
+    --kmc_memory)      OVERRIDE_KMC_MEM="$2";     shift 2 ;;
+    --window_size)     OVERRIDE_WINDOW_SIZE="$2"; shift 2 ;;
+    --skip_mapping)    SKIP_MAPPING=1;            shift ;;
+    --skip_blocks)     SKIP_BLOCKS=1;             shift ;;
+    --skip_vis)        SKIP_VIS=1;                shift ;;
+    --dominance_thr)   DOMINANCE_THR="$2";        shift 2 ;;
+    --min_counts)      MIN_COUNTS="$2";           shift 2 ;;
+    --species_colors)  SPECIES_COLORS="$2";       shift 2 ;;
+    --species_cols)    SPECIES_COLS="$2";         shift 2 ;;
+    --genome_title)    GENOME_TITLE="$2";         shift 2 ;;
+    --block_file)      BLOCK_FILE="$2";           shift 2 ;;
+    --dominance_vis)   DOMINANCE_VIS="$2";        shift 2 ;;
+    --lang)            LANG="$2";                 shift 2 ;;
+    --ncols)           NCOLS="$2";                shift 2 ;;
+    --n_parallel)      N_PARALLEL="$2";           shift 2 ;;
+    --n_kmc_parallel)  N_KMC_PARALLEL="$2";       shift 2 ;;
+    --chunk_size)      CHUNK_SIZE="$2";           shift 2 ;;
+    -h|--help)         usage ;;
     *) echo "[WARN] Unknown argument: $1"; shift ;;
   esac
 done
@@ -171,6 +198,26 @@ IFS=':' read -ra DIR_ARR <<< "$READ_DIRS"
   echo "[ERROR] species_names count (${#SP_ARR[@]}) != read_dirs count (${#DIR_ARR[@]})."; exit 1; }
 [[ "${#SP_ARR[@]}" -lt 2 ]] && { echo "[ERROR] At least 2 species required."; exit 1; }
 
+N_SPECIES="${#SP_ARR[@]}"
+
+# Auto-set N_PARALLEL if not specified (cap at 8 to avoid RAM overload)
+if [[ "$N_PARALLEL" -eq 0 ]]; then
+  N_PARALLEL=$(( N_SPECIES < 8 ? N_SPECIES : 8 ))
+fi
+
+# Threads per parallel job (for KMC and Python, to avoid over-subscription)
+THREADS_PER_JOB=$(( THREADS / N_PARALLEL ))
+[[ "$THREADS_PER_JOB" -lt 1 ]] && THREADS_PER_JOB=1
+
+# ── Check GNU parallel availability ──────────────────────────────────────────
+PARALLEL_AVAILABLE=0
+if command -v parallel &>/dev/null; then
+  PARALLEL_AVAILABLE=1
+else
+  echo "[WARN] GNU parallel not found — falling back to serial execution."
+  echo "       Install with: conda install -c conda-forge parallel"
+fi
+
 # ── Default colors / cols / title ─────────────────────────────────────────────
 DEFAULT_COLORS=("#E64B35" "#4DBBD5" "#00A087" "#3C5488" "#F39B7F"
                 "#8491B4" "#91D1C2" "#DC0000" "#7E6148" "#B09C85")
@@ -188,7 +235,7 @@ fi
 source "${MINICONDA_PATH:-$HOME/miniconda3}/bin/activate"
 conda activate "${CONDA_ENV:-kmer}"
 export LD_LIBRARY_PATH="${MINICONDA_PATH:-$HOME/miniconda3}/envs/${CONDA_ENV:-kmer}/lib:${LD_LIBRARY_PATH:-}"
-export OMP_NUM_THREADS="$THREADS"
+export OMP_NUM_THREADS="$THREADS_PER_JOB"
 
 SCRIPT_PY_DIR="${LIB_DIR}/supervised"
 PROCESS_ROOT="${WORK_DIR}/process/speci_kmer_k${K}"
@@ -207,33 +254,61 @@ mkdir -p "$INPUT_KMER_DB_DIR" "$PROCESS_ORA_DIR" "$PROCESS_UNIQUE_DIR" \
 ALL_SPECIES=$(IFS=','; echo "${SP_ARR[*]}")
 
 echo "========================================================================"
-echo "KmerGenoPhaser — Supervised K-mer Module"
+echo "KmerGenoPhaser — Supervised K-mer Module  (v1.1)"
 echo "  K=${K}  | read_format=${READ_FORMAT}  | window=${WINDOW_SIZE} bp"
-printf "  Species (%d):\n" "${#SP_ARR[@]}"
+printf "  Species (%d):\n" "$N_SPECIES"
 for i in "${!SP_ARR[@]}"; do
   printf "    [%d] %-20s  ←  %s\n" "$((i+1))" "${SP_ARR[$i]}" "${DIR_ARR[$i]}"
 done
-echo "  Target genome : $TARGET_GENOME"
-echo "  Work dir      : $WORK_DIR"
+echo "  Target genome     : $TARGET_GENOME"
+echo "  Work dir          : $WORK_DIR"
+echo "  Parallelism       : N_PARALLEL=${N_PARALLEL}  N_KMC_PARALLEL=${N_KMC_PARALLEL}"
+echo "  Threads total     : ${THREADS}  (${THREADS_PER_JOB}/job when parallel)"
+echo "  Chunk size        : ${CHUNK_SIZE}  (calculate_specificity.py batch)"
+echo "  GNU parallel      : $([ "$PARALLEL_AVAILABLE" -eq 1 ] && echo available || echo NOT FOUND — serial fallback)"
 echo "========================================================================"
+
+# ── Helper: compute OTHERS string for a given species ────────────────────────
+_others_for() {
+  local SP="$1"
+  echo "$ALL_SPECIES" | sed "s/^${SP},//;s/,${SP}$//;s/,${SP},/,/"
+}
+
+# ── Helper: run a list of functions in parallel or serial ────────────────────
+# Usage: _parallel_or_serial N_JOBS joblog_path func arg1 arg2 ... via stdin
+# We export each step's function and use printf | parallel pattern.
+_run_parallel_species() {
+  local NJOBS="$1"; local JOBLOG="$2"; local FUNC_NAME="$3"
+  shift 3
+  # $@ = space-separated SP_ARR entries passed in
+  if [[ "$PARALLEL_AVAILABLE" -eq 1 && "$NJOBS" -gt 1 ]]; then
+    printf "%s\n" "$@" | \
+      parallel -j "${NJOBS}" \
+               --joblog "${JOBLOG}" \
+               --halt soon,fail=1 \
+               "${FUNC_NAME}" {}
+  else
+    for sp in "$@"; do
+      "${FUNC_NAME}" "$sp"
+    done
+  fi
+}
 
 # ============================================================================
 # Step 0: KMC counting
 # ============================================================================
 echo ""
-echo ">>> Step 0: KMC Counting  (format: ${READ_FORMAT})..."
+echo ">>> Step 0: KMC Counting  (format: ${READ_FORMAT}, N_KMC_PARALLEL=${N_KMC_PARALLEL})..."
 
-# File patterns per format
-if [[ "$READ_FORMAT" == "fa" ]]; then
-  FILE_PATTERN='\( -name "*.fa" -o -name "*.fasta" -o -name "*.fa.gz" -o -name "*.fasta.gz" \)'
-  KMC_FORMAT_FLAG="-fm"
-else
-  FILE_PATTERN='\( -name "*.fq" -o -name "*.fastq" -o -name "*.fq.gz" -o -name "*.fastq.gz" \)'
-  KMC_FORMAT_FLAG="-fq"
-fi
+_run_kmc_single() {
+  local SP="$1"
+  local F_DIR=""
+  # Look up corresponding dir from SP_ARR / DIR_ARR via name match
+  for i in "${!SP_ARR[@]}"; do
+    [[ "${SP_ARR[$i]}" == "$SP" ]] && F_DIR="${DIR_ARR[$i]}" && break
+  done
+  [[ -z "$F_DIR" ]] && { echo "  [ERROR] Could not find dir for $SP"; return 1; }
 
-process_kmc() {
-  local SP="$1"; local F_DIR="$2"
   local FA="${INPUT_KMER_DB_DIR}/${SP}_k${K}.fa"
   if [[ -s "$FA" ]]; then echo "  [skip] $SP KMC DB exists."; return 0; fi
 
@@ -242,15 +317,16 @@ process_kmc() {
   local TMP="${WORK_DIR}/tmp_kmc_${SP}"
   mkdir -p "$TMP"
 
-  # Find input files (FASTA or FASTQ)
   if [[ "$READ_FORMAT" == "fa" ]]; then
     find "$F_DIR" -maxdepth 1 \
       \( -name "*.fa" -o -name "*.fasta" -o -name "*.fa.gz" -o -name "*.fasta.gz" \) \
       > "$LIST"
+    local KMC_FORMAT_FLAG="-fm"
   else
     find "$F_DIR" -maxdepth 1 \
       \( -name "*.fq" -o -name "*.fastq" -o -name "*.fq.gz" -o -name "*.fastq.gz" \) \
       > "$LIST"
+    local KMC_FORMAT_FLAG="-fq"
   fi
 
   if [[ ! -s "$LIST" ]]; then
@@ -261,64 +337,119 @@ process_kmc() {
   FILE_COUNT=$(wc -l < "$LIST")
   echo "  $SP: found $FILE_COUNT file(s) in $F_DIR"
 
-  kmc -k${K} -m${KMC_MEMORY} -t${THREADS} \
+  # When running parallel KMC jobs, divide threads among jobs
+  local KMC_THREADS="$THREADS"
+  [[ "$N_KMC_PARALLEL" -gt 1 ]] && KMC_THREADS="$THREADS_PER_JOB"
+
+  kmc -k${K} -m${KMC_MEMORY} -t${KMC_THREADS} \
       -ci${MIN_COUNT} -cs100000000 \
-      ${KMC_FORMAT_FLAG} @"$LIST" "$DB" "$TMP"
+      ${KMC_FORMAT_FLAG} @"$LIST" "$DB" "$TMP" \
+      2>&1 | sed "s/^/  [${SP}] /"
 
   kmc_tools dump "$DB" "$FA"
   rm -rf "$TMP" "$LIST" "${DB}.kmc_pre" "${DB}.kmc_suf"
   echo "  [done] $SP KMC."
 }
 
-for i in "${!SP_ARR[@]}"; do
-  process_kmc "${SP_ARR[$i]}" "${DIR_ARR[$i]}"
-done
+export -f _run_kmc_single
+export INPUT_KMER_DB_DIR WORK_DIR READ_FORMAT K KMC_MEMORY MIN_COUNT THREADS \
+       N_KMC_PARALLEL THREADS_PER_JOB
+# Export SP_ARR / DIR_ARR as encoded strings so sub-shells can reconstruct them
+export SP_ARR_STR="${SP_ARR[*]}"
+export DIR_ARR_STR="${DIR_ARR[*]}"
+
+# Reconstruct arrays in sub-shell via the exported strings
+_run_kmc_single_wrapper() {
+  read -ra SP_ARR <<< "$SP_ARR_STR"
+  read -ra DIR_ARR <<< "$DIR_ARR_STR"
+  _run_kmc_single "$1"
+}
+export -f _run_kmc_single_wrapper
+
+if [[ "$PARALLEL_AVAILABLE" -eq 1 && "$N_KMC_PARALLEL" -gt 1 ]]; then
+  echo "  [parallel] Running ${N_SPECIES} KMC jobs with N_KMC_PARALLEL=${N_KMC_PARALLEL}..."
+  printf "%s\n" "${SP_ARR[@]}" | \
+    parallel -j "${N_KMC_PARALLEL}" \
+             --joblog "${WORK_DIR}/step0_kmc_parallel.log" \
+             --halt soon,fail=1 \
+             _run_kmc_single_wrapper {}
+else
+  echo "  [serial] Running KMC jobs one at a time..."
+  for i in "${!SP_ARR[@]}"; do
+    _run_kmc_single "${SP_ARR[$i]}"
+  done
+fi
 
 # ============================================================================
 # Step 1: Specificity scoring
 # ============================================================================
 echo ""
-echo ">>> Step 1: Specificity Scoring..."
+echo ">>> Step 1: Specificity Scoring (N_PARALLEL=${N_PARALLEL}, chunk_size=${CHUNK_SIZE})..."
 
-for SP in "${SP_ARR[@]}"; do
+_run_specificity() {
+  local SP="$1"
+  local OTHERS
   OTHERS=$(echo "$ALL_SPECIES" | sed "s/^${SP},//;s/,${SP}$//;s/,${SP},/,/")
-  OUT="${PROCESS_ORA_DIR}/${SP}_top_weighted_k${K}_complex.txt"
+  local OUT="${PROCESS_ORA_DIR}/${SP}_top_weighted_k${K}_complex.txt"
   if [[ -s "$OUT" ]]; then
     echo "  [skip] $SP score file exists."
-  else
-    python "${SCRIPT_PY_DIR}/calculate_specificity.py" \
-      --kmer_db_dir   "$INPUT_KMER_DB_DIR" \
-      --output_dir    "$PROCESS_ORA_DIR" \
-      --species       "$SP" \
-      --other_species "$OTHERS" \
-      --k             "$K" \
-      --top_percent   "$TOP_PCT"
-    echo "  [done] $SP scored."
+    return 0
   fi
-done
+  echo "  [start] Scoring ${SP}..."
+  python "${SCRIPT_PY_DIR}/calculate_specificity.py" \
+    --kmer_db_dir   "$INPUT_KMER_DB_DIR" \
+    --output_dir    "$PROCESS_ORA_DIR" \
+    --species       "$SP" \
+    --other_species "$OTHERS" \
+    --k             "$K" \
+    --top_percent   "$TOP_PCT" \
+    --chunk_size    "$CHUNK_SIZE" \
+    2>&1 | sed "s/^/  [${SP}] /"
+  echo "  [done] ${SP} scored."
+}
+
+export -f _run_specificity
+export ALL_SPECIES PROCESS_ORA_DIR INPUT_KMER_DB_DIR SCRIPT_PY_DIR K TOP_PCT CHUNK_SIZE
+
+_run_parallel_species "${N_PARALLEL}" \
+  "${WORK_DIR}/step1_specificity_parallel.log" \
+  _run_specificity \
+  "${SP_ARR[@]}"
 
 # ============================================================================
 # Step 1.5: Unique filtering
 # ============================================================================
 echo ""
-echo ">>> Step 1.5: Unique Filtering..."
+echo ">>> Step 1.5: Unique Filtering (N_PARALLEL=${N_PARALLEL})..."
 
-for SP in "${SP_ARR[@]}"; do
+_run_filter() {
+  local SP="$1"
+  local OTHERS
   OTHERS=$(echo "$ALL_SPECIES" | sed "s/^${SP},//;s/,${SP}$//;s/,${SP},/,/")
-  OUT="${PROCESS_UNIQUE_DIR}/${SP}_unique_k${K}_complex.txt"
+  local OUT="${PROCESS_UNIQUE_DIR}/${SP}_unique_k${K}_complex.txt"
   if [[ -s "$OUT" ]]; then
     echo "  [skip] $SP unique file exists."
-  else
-    python "${SCRIPT_PY_DIR}/filter_unique_kmer.py" \
-      --input_dir     "$PROCESS_ORA_DIR" \
-      --kmer_db_dir   "$INPUT_KMER_DB_DIR" \
-      --output_dir    "$PROCESS_UNIQUE_DIR" \
-      --species       "$SP" \
-      --other_species "$OTHERS" \
-      --k             "$K"
-    echo "  [done] $SP filtered."
+    return 0
   fi
-done
+  echo "  [start] Filtering ${SP}..."
+  python "${SCRIPT_PY_DIR}/filter_unique_kmer.py" \
+    --input_dir     "$PROCESS_ORA_DIR" \
+    --kmer_db_dir   "$INPUT_KMER_DB_DIR" \
+    --output_dir    "$PROCESS_UNIQUE_DIR" \
+    --species       "$SP" \
+    --other_species "$OTHERS" \
+    --k             "$K" \
+    2>&1 | sed "s/^/  [${SP}] /"
+  echo "  [done] ${SP} filtered."
+}
+
+export -f _run_filter
+export PROCESS_UNIQUE_DIR
+
+_run_parallel_species "${N_PARALLEL}" \
+  "${WORK_DIR}/step15_filter_parallel.log" \
+  _run_filter \
+  "${SP_ARR[@]}"
 
 # ============================================================================
 # Step 1.6: Merge
@@ -414,6 +545,11 @@ echo "SUPERVISED MODULE COMPLETED"
 echo "  K-mer tables : $TABLE_OUT"
 echo "  Block files  : $BLOCK_OUT"
 echo "  Plots        : $VIS_OUT"
+echo ""
+echo "  Parallel job logs:"
+echo "    Step 0  : ${WORK_DIR}/step0_kmc_parallel.log   (if N_KMC_PARALLEL>1)"
+echo "    Step 1  : ${WORK_DIR}/step1_specificity_parallel.log"
+echo "    Step 1.5: ${WORK_DIR}/step15_filter_parallel.log"
 echo ""
 echo "  → Feed blocks into unsupervised module:"
 echo "     KmerGenoPhaser unsupervised --block_dir ${BLOCK_OUT} ..."
