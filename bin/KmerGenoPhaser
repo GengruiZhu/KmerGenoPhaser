@@ -54,11 +54,16 @@ Typical workflow
       --output_dir     test/data
 
   # Step A — k-mer based (FASTA or FASTQ ancestor data)
+  #   --kmer_source: unique | ora | auto (default: auto)
+  #     - unique: strict species-specific k-mers only
+  #     - ora:    top 50% original specificity k-mers
+  #     - auto:   use unique if count >= genome_size_Mb, else fallback to ora
   KmerGenoPhaser supervised \\
       --target_genome  genome.fasta \\
       --species_names  "SES208,B48" \\
       --read_dirs      "/data/SES208:/data/B48" \\
       --read_format    fa \\
+      --kmer_source    auto \\
       --work_dir       work/supervised
 
   # Step B — SNP + ML (use existing bedGraphs with --existing_diag_dir)

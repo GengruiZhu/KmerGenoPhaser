@@ -21,7 +21,6 @@ dependencies:
       - torchvision==0.21.0
   # cyvcf2 via bioconda (needed for snpml module only)
   - bioconda::cyvcf2
-
   # ── R ─────────────────────────────────────────────────────────────────────
   - r-base=4.2
   - r-tidyverse
@@ -34,13 +33,18 @@ dependencies:
   - r-data.table
   - r-fs
   - r-showtext      # optional: Chinese font support
-
   # ── System tools ──────────────────────────────────────────────────────────
   - bioconda::kmc
   - bioconda::samtools
   - bioconda::bcftools
   - bioconda::tabix
   - bioconda::htslib   # provides bgzip
-
   # ── Fix libcrypto issue common with htslib tools ─────────────────────────
   - openssl=1.1
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Additional system dependencies (NOT managed by conda, usually pre-installed):
+#   - bc        : arithmetic calculations (supervised module)
+#                 Install: apt install bc (Debian/Ubuntu)
+#                          yum install bc (CentOS/RHEL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -10,6 +10,7 @@ Step-by-step guide from obtaining the software to running your first analysis.
 - conda installed (Miniconda or Anaconda)
 - No root permissions required
 - Disk: conda environment ~5–8 GB
+- System tool: `bc` (usually pre-installed on Linux)
 
 ---
 
@@ -76,7 +77,7 @@ bash install.sh
 Expected output (no FAIL items):
 
 ```
-  KmerGenoPhaser v1.0.0 — Installer
+  KmerGenoPhaser v1.1.0 — Installer
 
 === 1. Setting permissions ===
   [OK]  Permissions set.
@@ -103,7 +104,7 @@ WARN items are optional dependencies and won't prevent the pipeline from running
 
 ```bash
 KmerGenoPhaser --version
-# → KmerGenoPhaser v1.0.0
+# → KmerGenoPhaser v1.1.0
 
 KmerGenoPhaser --help
 
@@ -151,14 +152,31 @@ This generates `target.size` and `group_lists/<PatX>.txt`, and prints the `--sam
 
 ### supervised
 
+The `--kmer_source` parameter controls which k-mers are used for mapping:
+
+| Value | Behavior |
+|-------|----------|
+| `unique` | Use only species-specific k-mers (strict filtering, best for complex polyploids with deep resequencing) |
+| `ora` | Use top 50% of original specificity-scored k-mers (for simple hybrids with limited data) |
+| `auto` | (default) Use `unique` if count ≥ genome size (Mb), otherwise fallback to `ora` with warning |
+
 ```bash
 KmerGenoPhaser supervised \
     --target_genome  test/data/target.fasta \
     --species_names  "AncestorA,AncestorB" \
     --read_dirs      "test/data/reads/AncestorA:test/data/reads/AncestorB" \
     --read_format    fa \
+    --kmer_source    auto \
     --work_dir       test/work/supervised
 ```
+
+**Ancestor input directory structure:**
+
+Each directory in `--read_dirs` is scanned (top-level only) for files matching `--read_format`:
+- `fa`: `*.fa`, `*.fasta`, `*.fa.gz`, `*.fasta.gz`
+- `fq`: `*.fq`, `*.fastq`, `*.fq.gz`, `*.fastq.gz`
+
+All matching files are combined for that ancestor species.
 
 ### snpml (with pre-computed bedGraphs)
 
@@ -201,6 +219,9 @@ KmerGenoPhaser unsupervised \
 | `R:patchwork` / `R:ggrepel` FAIL | `Rscript -e 'install.packages(c("patchwork","ggrepel"))'` |
 | `cyvcf2` not found | `conda install -c bioconda cyvcf2` |
 | `CONDA_ENV` not found | Edit `conf/kmergenophaser.conf`, set `CONDA_ENV` to your env name |
+| `bc: command not found` | `sudo apt install bc` (Debian/Ubuntu) or `sudo yum install bc` (CentOS/RHEL) |
+| unique k-mers too few (auto fallback) | Normal for simple hybrids; use `--kmer_source ora` if intentional |
+| No files found in read_dirs | Check file extensions match `--read_format` (fa/fq) |
 
 ---
 
