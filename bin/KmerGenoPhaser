@@ -6,7 +6,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"    # .../KmerGenoPhaser/bin/
@@ -367,3 +367,4 @@ case "$1" in
     exit 1
     ;;
 esac
+
