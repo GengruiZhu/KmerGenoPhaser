@@ -171,7 +171,7 @@ done
 _err=0
 [[ -z "${INPUT_FASTA}"  ]] && { echo "[ERROR] --input_fasta is required"  >&2; _err=1; }
 [[ -z "${SPECIES_NAME}" ]] && { echo "[ERROR] --species_name is required" >&2; _err=1; }
-[[ -z "${TARGET_CHROMS}"]  ] && { echo "[ERROR] --target_chroms is required" >&2; _err=1; }
+[[ -z "${TARGET_CHROMS}"]] && { echo "[ERROR] --target_chroms is required" >&2; _err=1; }
 [[ -z "${WORK_DIR}"     ]] && { echo "[ERROR] --work_dir is required"     >&2; _err=1; }
 [[ "${_err}" -ne 0 ]] && { usage >&2; exit 1; }
 
