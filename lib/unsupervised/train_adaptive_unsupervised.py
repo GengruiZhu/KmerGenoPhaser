@@ -292,7 +292,7 @@ class AdaptiveTrainer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_pickle', required=True)
-    parser.add_argument('--output_matrix', required=True)
+    parser.add_argument('--output_tsv', required=True)
     # ── 新增：亚基因组分配 JSON 输出路径（可选，不传则不输出）──
     parser.add_argument('--output_subgenome_json', default=None,
                         help="亚基因组分配结果 JSON 输出路径（供后续脚本读取）")
