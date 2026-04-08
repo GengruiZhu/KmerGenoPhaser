@@ -224,8 +224,10 @@ walk(major_chroms, function(major_chrom_id) {
 
   data_raw <- tryCatch(
     map_dfr(files_to_load, function(f) {
-      d <- read_tsv(f, show_col_types = FALSE)
-      colnames(d) <- trimws(colnames(d))
+      d <- read_tsv(f, show_col_types = FALSE, comment = "")
+      # FIX: map_kmers_to_genome.py writes "#Start" as the first column header;
+      #      strip any leading '#' so Start/End matching works correctly.
+      colnames(d) <- trimws(sub("^#+", "", colnames(d)))
       col_lower   <- tolower(colnames(d))
       start_c     <- colnames(d)[col_lower == "start"][1]
       end_c       <- colnames(d)[col_lower == "end"][1]
