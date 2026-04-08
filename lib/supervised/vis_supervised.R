@@ -4,13 +4,13 @@
 # =============================================================================
 # Produces two plot types per homologous chromosome group:
 #   1. Proportional stacked bar  (continuous k-mer proportion)
-#   2. Dominant ancestry map     (window majority call ≥ dominance_threshold)
+#   2. Dominant ancestry map     (window majority call >= dominance_threshold)
 #
 # Fully generic: species names, colors, column mapping, titles are all CLI args.
 #
 # Usage:
 #   Rscript vis_supervised.R \
-#       --data_dir      /path/to/mapping_counts_tsv \
+#       --data_dir      /path/to/mapping_tsv \
 #       --output_dir    /path/to/output \
 #       --species_names "SSPON,SOFFI" \
 #       --species_cols  "SES208,B48" \
@@ -152,10 +152,12 @@ legend_labels_dom  <- c(setNames(sp_names, sp_names), Mixed = label_mixed)
 
 # =============================================================================
 # 3) Load data files
+# FIX: pattern changed from "_mapping_counts\\.tsv$" to "_mapping\\.tsv$"
+#      to match actual output of map_kmers_to_genome.py (*_mapping.tsv)
 # =============================================================================
-all_files <- dir_ls(p$data_dir, regexp = "_mapping_counts\\.tsv$")
+all_files <- dir_ls(p$data_dir, regexp = "_mapping\\.tsv$")
 if (length(all_files) == 0)
-  stop("No *_mapping_counts.tsv files found in: ", p$data_dir)
+  stop("No *_mapping.tsv files found in: ", p$data_dir)
 
 file_data <- tibble(
   file_path   = all_files,
@@ -197,15 +199,12 @@ walk(major_chroms, function(major_chrom_id) {
   data_raw <- tryCatch(
     map_dfr(files_to_load, function(f) {
       d <- read_tsv(f, show_col_types = FALSE)
-      # normalise column names: lowercase
       colnames(d) <- trimws(colnames(d))
-      # Identify Start/End columns (case-insensitive)
       col_lower <- tolower(colnames(d))
       start_c <- colnames(d)[col_lower == "start"][1]
       end_c   <- colnames(d)[col_lower == "end"][1]
       if (is.na(start_c) || is.na(end_c))
         stop("Cannot find Start/End columns in ", basename(f))
-      # Identify species count columns
       missing_cols <- sp_cols[!sp_cols %in% colnames(d)]
       if (length(missing_cols) > 0)
         stop("Missing species columns: ", paste(missing_cols, collapse = ", "),
@@ -244,7 +243,6 @@ walk(major_chroms, function(major_chrom_id) {
       Start_Mb = Start / 1e6, End_Mb = End / 1e6
     )
 
-  # Dominant call: which species proportion >= threshold; else "Mixed"
   p_cols <- paste0("P_", sp_names)
   data_dom <- data_dom %>%
     rowwise() %>%
@@ -316,9 +314,8 @@ walk(major_chroms, function(major_chrom_id) {
                             labels = legend_labels_prop, breaks = sp_names) +
           scale_y_continuous(limits = c(-18, 158), breaks = c(0, 50, 100))
 
-        # Annotation text per species
         x_mid <- mean(range(df_f$Start_Mb))
-        y_pos <- seq(147 - 17 * (n_sp - 1), 147, by = 17)  # top-down
+        y_pos <- seq(147 - 17 * (n_sp - 1), 147, by = 17)
         for (s_idx in seq_along(sp_names)) {
           p_plot <- p_plot +
             annotate("text", x = x_mid, y = y_pos[s_idx],
