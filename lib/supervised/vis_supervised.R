@@ -304,8 +304,10 @@ walk(major_chroms, function(major_chrom_id) {
     group_by(Chr) %>%
     summarise(
       total_len = sum(window_len),
+      # FIX: .y is map2() syntax and is undefined inside across();
+      #      use cur_column() to get the current species name being iterated.
       across(all_of(sp_names),
-             ~ sum(window_len[Dominant_Status == .y], na.rm = TRUE),
+             ~ sum(window_len[Dominant_Status == cur_column()], na.rm = TRUE),
              .names = "len_{.col}"),
       len_mixed = sum(window_len[Dominant_Status == "Mixed"], na.rm = TRUE),
       .groups = "drop"
