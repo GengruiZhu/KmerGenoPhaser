@@ -12,25 +12,6 @@
 #   Step 3  → map_kmers_to_genome.py     (map k-mers onto target genome)
 #   Step 3.5→ mapping_counts_to_blocks.py (counts TSV → block .txt files)
 #   Step 4  → vis_supervised.R           (visualization)
-#
-# Examples:
-#   # Sugarcane (ancestor FASTA files, use unique k-mers)
-#   KmerGenoPhaser supervised \
-#       --target_genome XTT22_Chr1A.fasta \
-#       --species_names "SES208,B48" \
-#       --read_dirs     "/data/SES208:/data/B48" \
-#       --read_format   fa \
-#       --kmer_source   unique \
-#       --work_dir      /path/to/work
-#
-#   # Simple hybrid (use ora k-mers when unique too few)
-#   KmerGenoPhaser supervised \
-#       --target_genome hybrid.fasta \
-#       --species_names "ParentA,ParentB" \
-#       --read_dirs     "/data/ParentA:/data/ParentB" \
-#       --read_format   fa \
-#       --kmer_source   auto \
-#       --work_dir      /path/to/work
 # =============================================================================
 set -euo pipefail
 
@@ -55,18 +36,11 @@ Required:
 Optional — input format:
   --read_format    <str>    Input file format: fa (FASTA) or fq (FASTQ)
                             (default: fq)
-                            fa: reads *.fa / *.fasta / *.fa.gz / *.fasta.gz
-                            fq: reads *.fq / *.fastq / *.fq.gz / *.fastq.gz
 
 Optional — k-mer source selection:
   --kmer_source    <str>    K-mer source for merging: unique | ora | auto
                             (default: auto)
-                            unique: use only unique k-mers (strict filtering)
-                            ora:    use top 50% original specificity k-mers
-                            auto:   use unique if count >= genome_size_Mb,
-                                    otherwise fallback to ora with warning
-  --ora_top_pct    <float>  Top percentage of ora k-mers to use when
-                            kmer_source=ora or auto fallback (default: 0.5)
+  --ora_top_pct    <float>  Top percentage of ora k-mers to use (default: 0.5)
 
 Optional — k-mer pipeline:
   --config         <path>   Config file (default: ${DEFAULT_CONF})
@@ -81,10 +55,8 @@ Optional — k-mer pipeline:
 
 Optional — block output (Step 3.5):
   --skip_blocks             Skip block file generation after mapping
-  --dominance_thr  <float>  Min species fraction to call a block
-                            (default: 0.55)
-  --min_counts     <int>    Min total k-mer count per window to call
-                            (below this → LowInfo block, default: 10)
+  --dominance_thr  <float>  Min species fraction to call a block (default: 0.55)
+  --min_counts     <int>    Min total k-mer count per window (default: 10)
 
 Optional — visualization (Step 4):
   --skip_vis                Skip visualization
@@ -202,9 +174,19 @@ fi
 [[ -z "$GENOME_TITLE"  ]] && GENOME_TITLE="${SPECIES_NAMES//,/+}"
 
 # ── Environment ───────────────────────────────────────────────────────────────
-source "${MINICONDA_PATH:-$HOME/miniconda3}/bin/activate"
-conda activate "${CONDA_ENV:-kmer}"
-export LD_LIBRARY_PATH="${MINICONDA_PATH:-$HOME/miniconda3}/envs/${CONDA_ENV:-kmer}/lib:${LD_LIBRARY_PATH:-}"
+# FIX: Only activate conda if the target environment is not already active.
+#      Double-activation (user script + this script) causes conda to exit
+#      the environment unexpectedly.
+_TARGET_ENV="${CONDA_ENV:-kmer}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "${_TARGET_ENV}" ]]; then
+  echo "[INFO] Activating conda environment: ${_TARGET_ENV}"
+  source "${MINICONDA_PATH:-$HOME/miniconda3}/bin/activate"
+  conda activate "${_TARGET_ENV}"
+else
+  echo "[INFO] Conda environment already active: ${CONDA_DEFAULT_ENV} — skipping activation"
+fi
+
+export LD_LIBRARY_PATH="${MINICONDA_PATH:-$HOME/miniconda3}/envs/${_TARGET_ENV}/lib:${LD_LIBRARY_PATH:-}"
 export OMP_NUM_THREADS="$THREADS"
 
 SCRIPT_PY_DIR="${LIB_DIR}/supervised"
@@ -223,7 +205,7 @@ mkdir -p "$INPUT_KMER_DB_DIR" "$PROCESS_ORA_DIR" "$PROCESS_UNIQUE_DIR" \
 
 ALL_SPECIES=$(IFS=','; echo "${SP_ARR[*]}")
 
-# ── Helper: build OTHERS list (exclude current species from ALL_SPECIES) ──────
+# ── Helper: build OTHERS list ─────────────────────────────────────────────────
 build_others() {
   local current="$1"
   local others=()
@@ -238,8 +220,6 @@ build_others() {
 get_genome_size_mb() {
   local fasta="$1"
   local total_bp=0
-
-  # Use samtools faidx if available, otherwise use awk
   if command -v samtools &> /dev/null; then
     if [[ ! -f "${fasta}.fai" ]]; then
       samtools faidx "$fasta" 2>/dev/null || true
@@ -248,13 +228,9 @@ get_genome_size_mb() {
       total_bp=$(awk '{sum+=$2} END{print sum}' "${fasta}.fai")
     fi
   fi
-
-  # Fallback: parse FASTA directly
   if [[ "$total_bp" -eq 0 ]]; then
     total_bp=$(awk '/^>/{next} {sum+=length($0)} END{print sum}' "$fasta")
   fi
-
-  # Convert to Mb (integer)
   echo $(( total_bp / 1000000 ))
 }
 
@@ -278,12 +254,9 @@ echo "========================================================================"
 echo ""
 echo ">>> Step 0: KMC Counting  (format: ${READ_FORMAT})..."
 
-# File patterns per format
 if [[ "$READ_FORMAT" == "fa" ]]; then
-  FILE_PATTERN='\( -name "*.fa" -o -name "*.fasta" -o -name "*.fa.gz" -o -name "*.fasta.gz" \)'
   KMC_FORMAT_FLAG="-fm"
 else
-  FILE_PATTERN='\( -name "*.fq" -o -name "*.fastq" -o -name "*.fq.gz" -o -name "*.fastq.gz" \)'
   KMC_FORMAT_FLAG="-fq"
 fi
 
@@ -297,7 +270,6 @@ process_kmc() {
   local TMP="${WORK_DIR}/tmp_kmc_${SP}"
   mkdir -p "$TMP"
 
-  # Find input files (FASTA or FASTQ)
   if [[ "$READ_FORMAT" == "fa" ]]; then
     find "$F_DIR" -maxdepth 1 \
       \( -name "*.fa" -o -name "*.fasta" -o -name "*.fa.gz" -o -name "*.fasta.gz" \) \
@@ -376,12 +348,11 @@ for SP in "${SP_ARR[@]}"; do
 done
 
 # ============================================================================
-# Step 1.6: Merge (with kmer_source selection)
+# Step 1.6: Merge
 # ============================================================================
 echo ""
 echo ">>> Step 1.6: Merging (kmer_source=${KMER_SOURCE})..."
 
-# Function to count k-mers in a file (excluding header)
 count_kmers() {
   local file="$1"
   if [[ -s "$file" ]]; then
@@ -393,7 +364,6 @@ count_kmers() {
   fi
 }
 
-# Function to get top N% k-mers from ora file sorted by FinalScore
 get_top_ora_kmers() {
   local ora_file="$1"
   local species="$2"
@@ -405,14 +375,12 @@ get_top_ora_kmers() {
   top_n=$(echo "$total_lines * $top_pct" | bc | cut -d'.' -f1)
   [[ "$top_n" -lt 1 ]] && top_n=1
 
-  # Use awk instead of tail|head to avoid SIGPIPE with set -o pipefail
   awk -v n="$top_n" -v sp="$species" 'NR>1 && NR<=n+1 {print $2"\t"$1"\t"sp}' "$ora_file"
 }
 
 MERGED_RAW="${PROCESS_FINAL_DIR}/all_species_unique_merged_raw.txt"
 echo -e "Kmer\tFinalScore\tSpecies" > "$MERGED_RAW"
 
-# Track which source was actually used
 declare -A ACTUAL_SOURCE
 
 for SP in "${SP_ARR[@]}"; do
@@ -424,7 +392,6 @@ for SP in "${SP_ARR[@]}"; do
 
   USE_SOURCE="$KMER_SOURCE"
 
-  # Auto-selection logic
   if [[ "$KMER_SOURCE" == "auto" ]]; then
     if [[ "$UNIQUE_COUNT" -ge "$GENOME_SIZE_MB" ]]; then
       USE_SOURCE="unique"
@@ -435,7 +402,6 @@ for SP in "${SP_ARR[@]}"; do
     fi
   fi
 
-  # Force ora if unique is empty regardless of setting
   if [[ "$USE_SOURCE" == "unique" && "$UNIQUE_COUNT" -eq 0 ]]; then
     echo "  [WARN] $SP: unique k-mer file is empty, falling back to ora"
     USE_SOURCE="ora"
@@ -447,7 +413,6 @@ for SP in "${SP_ARR[@]}"; do
     awk -v sp="$SP" 'NR>1 {print $2"\t"$1"\t"sp}' "$UNIQUE_FILE" >> "$MERGED_RAW"
     echo "  $SP: using unique k-mers (n=$UNIQUE_COUNT)"
   else
-    # [FIX] Also check that ora file is non-empty before extracting
     if [[ "$ORA_COUNT" -eq 0 ]]; then
       echo "  [WARN] $SP: ora k-mer file is also empty! No k-mers available."
     else
@@ -458,7 +423,6 @@ for SP in "${SP_ARR[@]}"; do
   fi
 done
 
-# Summary
 echo ""
 echo "  [Summary] K-mer source selection:"
 for SP in "${SP_ARR[@]}"; do
@@ -468,18 +432,10 @@ done
 MERGED_COUNT=$(( $(wc -l < "$MERGED_RAW") - 1 ))
 echo "  [done] Merged total: $MERGED_COUNT k-mers"
 
-# [FIX] Validate merged file has data rows before proceeding
 if [[ "$MERGED_COUNT" -le 0 ]]; then
   echo ""
   echo "[ERROR] Merged k-mer file is empty (0 data rows)."
-  echo "        Possible causes:"
-  echo "          1) KMC (Step 0) found no k-mers — check --min_count ($MIN_COUNT),"
-  echo "             it may be too high for your data."
-  echo "          2) Specificity scoring (Step 1) produced empty output — check"
-  echo "             input FASTA/FASTQ files in --read_dirs."
-  echo "          3) Unique filtering (Step 1.5) removed all k-mers — try"
-  echo "             --kmer_source ora to skip unique filtering."
-  echo "        Merged file: $MERGED_RAW"
+  echo "        Check --min_count ($MIN_COUNT) or input files in --read_dirs."
   exit 1
 fi
 
@@ -495,16 +451,10 @@ python "${SCRIPT_PY_DIR}/equalize_and_sample.py" \
   --min_score   "$MIN_SCORE" \
   --bin_size    1.0
 
-# [FIX] Validate equalized output file exists and has data
 if [[ ! -s "$FINAL_BALANCED" ]]; then
   echo ""
   echo "[ERROR] Equalized k-mer file was not created or is empty."
-  echo "        File: $FINAL_BALANCED"
-  echo "        Possible causes:"
-  echo "          1) All k-mers were filtered by --min_score ($MIN_SCORE)."
-  echo "             Try lowering it, e.g. --min_score 0.8 or --min_score 0.7"
-  echo "          2) The merged input had too few k-mers ($MERGED_COUNT total)."
-  echo "             Check Step 1.6 output: $MERGED_RAW"
+  echo "        Try lowering --min_score (current: $MIN_SCORE)"
   exit 1
 fi
 
@@ -537,7 +487,7 @@ else
 fi
 
 # ============================================================================
-# Step 3.5: Counts TSV → block .txt files (for unsupervised input)
+# Step 3.5: Counts TSV → block .txt files
 # ============================================================================
 if [[ "$SKIP_BLOCKS" -eq 0 ]]; then
   echo ""
@@ -572,7 +522,6 @@ if [[ "$SKIP_VIS" -eq 0 ]]; then
   )
   [[ -n "$BLOCK_FILE" ]] && VIS_ARGS+=("--block_file" "$BLOCK_FILE")
 
-  # [FIX] Proper error handling for Rscript under set -e
   if Rscript "${LIB_DIR}/supervised/vis_supervised.R" "${VIS_ARGS[@]}"; then
     echo "  [done] Plots: $VIS_OUT"
   else
