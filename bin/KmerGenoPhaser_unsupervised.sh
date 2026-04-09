@@ -2,28 +2,14 @@
 # =============================================================================
 #  KmerGenoPhaser_unsupervised.sh  —  v1.1  (2026-03-31)
 # =============================================================================
-#  Autoencoder-based ancestry block discovery.
-#
-#  v1.1 changes vs v1.0:
-#    • New --encoding parameter (kmer | fft | concat)
-#    • New --fft_size parameter
-#    • New --feature_mode parameter (block | genome)
-#    • INPUT_DIM is now auto-computed from encoding + k-mer range
-#    • Feature extraction now routes to extract_block_features_fft.py (new)
-#      or window_to_spectral_features_v2.py (fixed) based on --feature_mode
-#    • genome mode disables block-dependent steps (3, 4, karyotype)
-# =============================================================================
-
 set -euo pipefail
 
-# ── locate the package root ──────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONF_FILE="${PACKAGE_DIR}/conf/kmergenophaser.conf"
 SCRIPT_PY_DIR="${PACKAGE_DIR}/lib/unsupervised"
 LIB_DIR="${PACKAGE_DIR}/lib"
 
-# ── load defaults from conf ──────────────────────────────────────────────────
 if [[ ! -f "${CONF_FILE}" ]]; then
     echo "[ERROR] Config not found: ${CONF_FILE}" >&2
     exit 1
@@ -31,27 +17,23 @@ fi
 # shellcheck source=/dev/null
 source "${CONF_FILE}"
 
-# ── default values (may be overridden by CLI) ────────────────────────────────
 INPUT_FASTA=""
 SPECIES_NAME=""
 TARGET_CHROMS=""
 BLOCK_DIR=""
 WORK_DIR=""
 
-# v1.1 new parameters
-FEATURE_MODE="${FEATURE_MODE:-block}"     # block | genome
-ENCODING="${ENCODING:-concat}"            # kmer  | fft | concat
+FEATURE_MODE="${FEATURE_MODE:-block}"
+ENCODING="${ENCODING:-concat}"
 FFT_SIZE="${FFT_SIZE:-1024}"
 GENOME_WINDOW_SIZE="${GENOME_WINDOW_SIZE:-10000}"
 
-# existing parameters (read from conf, overridable via CLI)
 MIN_KMER="${MIN_KMER:-1}"
 MAX_KMER="${MAX_KMER:-5}"
 EPOCHS="${EPOCHS:-100000}"
 LATENT_DIM="${LATENT_DIM:-32}"
 THREADS="${THREADS:-20}"
 
-# flags
 SKIP_CHECK_BLOCKS=false
 SKIP_KARYOTYPE=false
 NO_BLOODLINE=false
@@ -60,7 +42,6 @@ GENOME_TITLE=""
 KARYOTYPE_COLORS=""
 CENTROMERE_FILE=""
 
-# ── usage ────────────────────────────────────────────────────────────────────
 usage() {
 cat <<EOF
 Usage: KmerGenoPhaser unsupervised [options]
@@ -75,9 +56,6 @@ Feature extraction (v1.1):
   --feature_mode   block|genome   block = per-block features (default)
                                   genome = sliding-window chromosome features
   --encoding       kmer|fft|concat  Encoding strategy (default: concat)
-                               kmer   : k-mer frequencies only
-                               fft    : complex FFT magnitudes only
-                               concat : k-mer + FFT  [recommended]
   --fft_size       <int>       FFT points (default: ${FFT_SIZE})
   --min_kmer       <int>       Min k-mer size (default: ${MIN_KMER})
   --max_kmer       <int>       Max k-mer size (default: ${MAX_KMER})
@@ -100,34 +78,9 @@ Skip flags:
   --skip_karyotype             Skip karyotype visualization (Step 5)
   --no_bloodline               Skip heatmap plotting
   --threads        <int>       CPU threads (default: ${THREADS})
-
-Examples:
-  # Block mode with concat encoding (recommended)
-  KmerGenoPhaser unsupervised \\
-      --input_fasta target.fasta --species_name MySpecies \\
-      --target_chroms Chr1A Chr1B --block_dir blocks/ --work_dir out/ \\
-      --encoding concat --fft_size 1024
-
-  # Genome mode (chromosome-level, FFT only)
-  KmerGenoPhaser unsupervised \\
-      --input_fasta target.fasta --species_name MySpecies \\
-      --target_chroms Chr1 Chr2 --work_dir out/ \\
-      --feature_mode genome --encoding fft
-
-  # Legacy k-mer only (v1.0 behaviour)
-  KmerGenoPhaser unsupervised \\
-      --input_fasta target.fasta --species_name MySpecies \\
-      --target_chroms Chr1A Chr1B --block_dir blocks/ --work_dir out/ \\
-      --encoding kmer
-
-INPUT_DIM reference:
-  encoding=kmer,   min=1, max=5 → 1364
-  encoding=fft,    fft_size=1024 → 1024
-  encoding=concat, min=1, max=5, fft_size=1024 → 2388  (auto-computed)
 EOF
 }
 
-# ── parse CLI arguments ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --input_fasta)       INPUT_FASTA="$2";        shift 2 ;;
@@ -167,12 +120,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ── validate required arguments ──────────────────────────────────────────────
 _err=0
-[[ -z "${INPUT_FASTA}"  ]] && { echo "[ERROR] --input_fasta is required"  >&2; _err=1; }
-[[ -z "${SPECIES_NAME}" ]] && { echo "[ERROR] --species_name is required" >&2; _err=1; }
+[[ -z "${INPUT_FASTA}"   ]] && { echo "[ERROR] --input_fasta is required"   >&2; _err=1; }
+[[ -z "${SPECIES_NAME}"  ]] && { echo "[ERROR] --species_name is required"  >&2; _err=1; }
 [[ -z "${TARGET_CHROMS}" ]] && { echo "[ERROR] --target_chroms is required" >&2; _err=1; }
-[[ -z "${WORK_DIR}"     ]] && { echo "[ERROR] --work_dir is required"     >&2; _err=1; }
+[[ -z "${WORK_DIR}"      ]] && { echo "[ERROR] --work_dir is required"      >&2; _err=1; }
 [[ "${_err}" -ne 0 ]] && { usage >&2; exit 1; }
 
 if [[ "${FEATURE_MODE}" == "block" && -z "${BLOCK_DIR}" ]]; then
@@ -180,30 +132,24 @@ if [[ "${FEATURE_MODE}" == "block" && -z "${BLOCK_DIR}" ]]; then
     exit 1
 fi
 
-# validate encoding
 case "${ENCODING}" in
     kmer|fft|concat) ;;
     *) echo "[ERROR] --encoding must be one of: kmer, fft, concat" >&2; exit 1 ;;
 esac
 
-# validate feature_mode
 case "${FEATURE_MODE}" in
     block|genome) ;;
     *) echo "[ERROR] --feature_mode must be one of: block, genome" >&2; exit 1 ;;
 esac
 
-# ── auto-compute INPUT_DIM ───────────────────────────────────────────────────
 INPUT_DIM=$(python3 - <<PYEOF
 import sys
 mk, xk = ${MIN_KMER}, ${MAX_KMER}
 fs      = ${FFT_SIZE}
 enc     = '${ENCODING}'
 fm      = '${FEATURE_MODE}'
-
 kmer_dim = sum(4**k for k in range(mk, xk + 1))
 fft_dim  = fs
-
-# genome mode only uses FFT
 if fm == 'genome':
     print(fft_dim)
 elif enc == 'kmer':
@@ -218,25 +164,31 @@ else:
 PYEOF
 )
 
-# ── set up directories ───────────────────────────────────────────────────────
 GENOME_TITLE="${GENOME_TITLE:-${SPECIES_NAME}}"
 PROCESS_DIR="${WORK_DIR}/process/${SPECIES_NAME}"
 OUTPUT_DIR="${WORK_DIR}/output/bloodline/${SPECIES_NAME}"
 
 mkdir -p "${PROCESS_DIR}" "${OUTPUT_DIR}"
 
-# ── conda environment activation ─────────────────────────────────────────────
+# ── Environment ───────────────────────────────────────────────────────────────
+# FIX: Only activate conda if the target environment is not already active.
+#      Double-activation (user script + this script) causes conda to exit
+#      the environment unexpectedly.
 MINICONDA_PATH="${MINICONDA_PATH:-${HOME}/miniconda3}"
-if [[ -f "${MINICONDA_PATH}/etc/profile.d/conda.sh" ]]; then
-    # shellcheck source=/dev/null
-    source "${MINICONDA_PATH}/etc/profile.d/conda.sh"
-    conda activate "${CONDA_ENV}" 2>/dev/null || true
+_TARGET_ENV="${CONDA_ENV:-kmer}"
+if [[ "${CONDA_DEFAULT_ENV:-}" != "${_TARGET_ENV}" ]]; then
+    echo "[INFO] Activating conda environment: ${_TARGET_ENV}"
+    if [[ -f "${MINICONDA_PATH}/etc/profile.d/conda.sh" ]]; then
+        # shellcheck source=/dev/null
+        source "${MINICONDA_PATH}/etc/profile.d/conda.sh"
+    fi
+    conda activate "${_TARGET_ENV}" 2>/dev/null || true
+else
+    echo "[INFO] Conda environment already active: ${CONDA_DEFAULT_ENV} — skipping activation"
 fi
 
-# ── build target_chroms array for python scripts ──────────────────────────────
 read -r -a TARGET_CHROMS_ARRAY <<< "${TARGET_CHROMS}"
 
-# =============================================================================
 echo "========================================================================"
 echo "  KmerGenoPhaser Unsupervised Pipeline  —  v1.1"
 echo "========================================================================"
@@ -254,7 +206,7 @@ echo "  Work dir      : ${WORK_DIR}"
 echo "========================================================================"
 
 # =============================================================================
-#  Step 0 (optional) — validate block files vs FASTA
+#  Step 0 — validate block files vs FASTA
 # =============================================================================
 if [[ "${FEATURE_MODE}" == "block" && "${SKIP_CHECK_BLOCKS}" == "false" ]]; then
     echo ""
@@ -288,8 +240,7 @@ if [[ "${FEATURE_MODE}" == "block" ]]; then
         --target_chroms  "${TARGET_CHROMS_ARRAY[@]}" \
         && echo "  ✓ Feature extraction complete" \
         || { echo "  ✗ Feature extraction failed!" >&2; exit 1; }
-
-else  # genome mode
+else
     echo "[Step 1/5] Extracting genome-window spectral features …"
     python "${SCRIPT_PY_DIR}/window_to_spectral_features_v2.py" \
         --input_fasta    "${INPUT_FASTA}" \
@@ -302,7 +253,7 @@ else  # genome mode
 fi
 
 # =============================================================================
-#  Step 2 — Train autoencoder & compute distance matrix
+#  Step 2 — Train autoencoder
 # =============================================================================
 echo ""
 echo "[Step 2/5] Training autoencoder  (INPUT_DIM=${INPUT_DIM}, epochs=${EPOCHS}) …"
@@ -318,7 +269,7 @@ python "${SCRIPT_PY_DIR}/train_adaptive_unsupervised.py" \
     || { echo "  ✗ Training failed!" >&2; exit 1; }
 
 # =============================================================================
-#  Steps 3-4 — Block-mode only  (bloodline annotation & nodata inference)
+#  Steps 3-4
 # =============================================================================
 if [[ "${FEATURE_MODE}" == "block" ]]; then
 
@@ -335,19 +286,18 @@ if [[ "${FEATURE_MODE}" == "block" ]]; then
         && echo "  ✓ Subgenome assignment complete" \
         || { echo "  ✗ Assignment failed!" >&2; exit 1; }
 
-    # ── Step 4: heatmap ──────────────────────────────────────────────────────
     if [[ "${NO_BLOODLINE}" == "false" ]]; then
         echo ""
         echo "[Step 4/5] Plotting bloodline heatmap …"
         python "${SCRIPT_PY_DIR}/plot_bloodline_heatmap.py" \
-            --distance_tsv   "${DISTANCE_TSV}" \
+            --distance_tsv    "${DISTANCE_TSV}" \
             --assignment_json "${SUBGENOME_JSON}" \
-            --output_dir     "${OUTPUT_DIR}/heatmap" \
+            --output_dir      "${OUTPUT_DIR}/heatmap" \
             && echo "  ✓ Heatmap complete" \
             || echo "  [WARN] Heatmap step encountered an error (non-fatal)"
     fi
 
-else  # genome mode — window-level heatmap only
+else
     if [[ "${NO_BLOODLINE}" == "false" ]]; then
         echo ""
         echo "[Step 4/5] Plotting genome window heatmap …"
@@ -360,7 +310,7 @@ else  # genome mode — window-level heatmap only
 fi
 
 # =============================================================================
-#  Step 5 — Karyotype visualization  (block mode only)
+#  Step 5 — Karyotype
 # =============================================================================
 if [[ "${FEATURE_MODE}" == "block" && "${SKIP_KARYOTYPE}" == "false" ]]; then
     echo ""
@@ -383,7 +333,6 @@ elif [[ "${FEATURE_MODE}" == "genome" ]]; then
     echo "[Step 5/5] Karyotype skipped (genome mode)"
 fi
 
-# =============================================================================
 echo ""
 echo "========================================================================"
 echo "  Pipeline complete."
