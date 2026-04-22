@@ -133,10 +133,12 @@ class AdaptiveTrainer:
 
         l_recon      = self.losses.reconstruction_loss(recon, x)
         l_fm         = self.losses.flow_matching_loss(self.model, z)
-        l_diversity  = self.losses.diversity_loss(z)
+        # v1.2: 传递 window_ids，按染色体质心计算 (论文 Eq.7)
+        l_diversity  = self.losses.diversity_loss(z, window_ids)
         l_smoothness = self.losses.local_smoothness_loss(z, window_ids)
         l_augment    = self.losses.augmentation_consistency_loss(z, z_aug)
-        l_spread     = self.losses.spread_loss(z)
+        # v1.2: 传递 window_ids，按染色体质心计算 (论文 Eq.11)
+        l_spread     = self.losses.spread_loss(z, window_ids)
 
         total = (weights['recon']      * l_recon      +
                  weights['fm']         * l_fm         +
