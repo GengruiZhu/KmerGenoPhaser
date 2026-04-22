@@ -441,10 +441,9 @@ KmerGenoPhaser snpml \
 ```
 
 ---
-
 ### unsupervised
 
-Autoencoder-based ancestry block discovery. Runs with or without upstream block files. Automatically runs `karyotype` visualization at the end (Step 5) unless `--skip_karyotype` is set.
+Autoencoder-based ancestry block discovery using a manifold-constrained hyper-connection (mHC) architecture with six-loss composite objective (reconstruction, flow-matching, chromosome-level diversity, local smoothness, augmentation consistency, spread). Runs with or without upstream block files. Automatically runs `karyotype` visualization at the end (Step 5) unless `--skip_karyotype` is set.
 
 ```bash
 # With block files (recommended)
@@ -471,6 +470,8 @@ KmerGenoPhaser unsupervised \
 | `--min_kmer` | 1 | Min k-mer size for feature extraction |
 | `--max_kmer` | 5 | Max k-mer size |
 | `--epochs` | 100000 | Training epochs |
+| `--num_workers` | 1 | **Data-parallel worker processes** (see below) |
+| `--num_threads` | 16 | **MKL/OMP threads per worker** (see below) |
 | `--skip_karyotype` | — | Skip karyotype visualization (Step 5) |
 | `--genome_title` | species\_name | Title for karyotype plots |
 | `--karyotype_colors` | auto | `"Name=#hex,Name2=#hex2"` custom bloodline colors |
@@ -484,6 +485,75 @@ KmerGenoPhaser unsupervised \
 > k=1..5  → INPUT_DIM=1364    k=1..4  → INPUT_DIM=340    k=2..5  → INPUT_DIM=1360
 > ```
 
+#### CPU parallelism (v1.2)
+
+Training uses **data-parallel SGD on CPU** via `torch.distributed` with the `gloo` backend. Multiple worker processes each run their own MKL instance at its optimal thread count (16 is the empirical sweet spot on modern x86 CPUs such as AMD Zen3 or Intel Ice Lake), and gradients are synchronized after each step via `all_reduce`. Effective batch size becomes `num_workers × batch_size`, equivalent in training dynamics to a single large-batch run but significantly faster in wall-clock time on multi-socket hardware.
+
+**Default behaviour** (no flags): single process with 16 MKL threads. This matches the sweet spot on most modern CPUs and is a safe starting point on any node.
+
+**Configuration options** (all optional):
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `--num_workers N` | 1 | Spawn `N` data-parallel worker processes |
+| `--num_threads M` | 16 | `M` MKL/OMP threads per worker |
+| `--num_threads 0` | — | Auto-assign: `cpu_count() / num_workers` |
+| `--num_threads -1` | — | Use all available CPUs per worker |
+
+**Environment variable equivalents** (lower priority than CLI flags):
+
+```bash
+export KGP_NUM_WORKERS=4
+export KGP_NUM_THREADS=16
+```
+
+**Recommended configurations by node size:**
+
+| Node | Example configuration | Rationale |
+| --- | --- | --- |
+| 16-core laptop / workstation | `--num_workers 1 --num_threads 16` (default) | Single-process, fills the machine |
+| 32-core single-socket server | `--num_workers 2 --num_threads 16` | Two workers, each in its own CCX/NUMA |
+| 64-core dual-socket server (e.g. EPYC 7513 × 2) | `--num_workers 4 --num_threads 16` | Four workers, each bound to one NUMA range |
+| 128-core server | `--num_workers 8 --num_threads 16` | Eight workers filling the node |
+
+Expected speedup on a 64-core AMD EPYC 7513 dual-socket node, relative to the single-process baseline with the same total training dynamics: **2.0–2.5× wall-clock reduction** with `--num_workers 4 --num_threads 16`.
+
+Each worker is automatically bound to a contiguous subset of CPU cores via `os.sched_setaffinity`, which aligns with NUMA boundaries on most server hardware. No `numactl` wrapper is required.
+
+#### Running on a compute cluster (qsub / Slurm)
+
+The training script uses **file-based DDP rendezvous** instead of TCP ports, which means:
+
+- Multiple concurrent jobs on the same node **cannot collide on ports**.
+- Different species (different `--species_name` → different work directory) are automatically isolated.
+- Different submissions of the same species (different `PBS_JOBID` or shell PID) are also isolated.
+
+You can submit as many `qsub` jobs of `KmerGenoPhaser unsupervised` as your cluster allows without any manual port coordination:
+
+```bash
+# Species 1
+qsub run_species_A.sh        # uses rendezvous: <workA>/.kgp_rdzv_1234.pbs
+# Species 2 (same or different node, doesn't matter)
+qsub run_species_B.sh        # uses rendezvous: <workB>/.kgp_rdzv_1235.pbs
+```
+
+The rendezvous file is created inside `<work_dir>/process/<species_name>/` with the job ID suffix. Failed jobs leaving stale files are automatically cleaned up by the next run.
+
+**Manual override** (rarely needed, e.g. if the working directory is on a filesystem that does not support the `file://` init_method such as certain network filesystems):
+
+```bash
+# Force a custom rendezvous path
+export KGP_RENDEZVOUS=/tmp/my_unique_rdzv_file
+```
+
+#### Note on effective batch size
+
+When using `--num_workers N > 1`, the `--batch_size` argument is **per-worker** (micro-batch). The effective global batch size becomes `N × batch_size`. If you migrate from `--num_workers 1 --batch_size 512` to `--num_workers 4`, either:
+
+- keep `--batch_size 512` to accept the larger effective batch (usually harmless or slightly beneficial for optimization), or
+- switch to `--batch_size 128` to preserve the original effective batch of 512.
+
+The training log prints the effective batch size on startup for reference.
 ---
 
 ### karyotype

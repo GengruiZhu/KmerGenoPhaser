@@ -2,26 +2,58 @@
 """
 自适应无监督基因组编码器
 自动发现亚基因组数量和结构
+
+v1.2 内容（保留）:
+  - mHC 的 layer_fn 使用 TransformBlock (FC+LN+GELU)
+  - Decoder 使用对称 mHC 架构 (论文 §3.3.3)
+  - 6 个 loss 与论文公式对齐
+
+v1.2 CPU 性能优化 (2026-04-22):
+  - 融合 3 个投影为 1 个 Linear (论文 Eq.14)
+  - Sinkhorn-Knopp 迭代用 @torch.jit.script 加速
+  - H_post 应用 + H_res 混合 + 残差合并融合为 1 个 scripted 函数
+  - 接口与输入/输出完全不变；shell 脚本无需修改
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
-# ==================== Sinkhorn-Knopp ====================
-class SinkhornKnopp(nn.Module):
-    def __init__(self, n_iter=20, epsilon=1e-8):
-        super().__init__()
-        self.n_iter = n_iter
-        self.epsilon = epsilon
+# ==================== JIT-scripted hot paths =====================
+#
+# 这些函数独立于 nn.Module，避免 Python 解释器开销。
+# 在 Sinkhorn 20 次迭代、逐 batch 逐层调用的场景下，JIT 化能显著降低开销。
 
-    def forward(self, H):
-        M = torch.exp(H)
-        for _ in range(self.n_iter):
-            M = M / (M.sum(dim=-1, keepdim=True) + self.epsilon)
-            M = M / (M.sum(dim=-2, keepdim=True) + self.epsilon)
-        return M
+@torch.jit.script
+def _sinkhorn_knopp_jit(logits: torch.Tensor, n_iters: int) -> torch.Tensor:
+    """
+    论文 Eq.9 的 Sinkhorn-Knopp 迭代，20 次行/列交替归一化。
+    输入 logits 是未归一化的原始矩阵 (batch, n, n)。
+    """
+    eps = 1e-8
+    m = torch.exp(logits)
+    for _ in range(n_iters):
+        m = m / (m.sum(dim=-1, keepdim=True) + eps)   # row normalize
+        m = m / (m.sum(dim=-2, keepdim=True) + eps)   # col normalize
+    return m
+
+
+@torch.jit.script
+def _fused_mhc_update(
+    x_streams: torch.Tensor,   # (B, n, C)
+    h_res: torch.Tensor,       # (B, n, n)
+    out: torch.Tensor,         # (B, C)      layer_fn 的输出
+    h_post: torch.Tensor,      # (B, n)
+) -> torch.Tensor:
+    """
+    论文 Eq.3:  X_{l+1} = H_res · X_l + H_post^T · F(·)
+    融合矩阵乘 + 广播乘 + 加法为一个 scripted 函数，减少中间张量分配。
+    返回 (B, n, C) 的更新后 streams。
+    """
+    mixed = torch.matmul(h_res, x_streams)                # (B, n, C)
+    update = out.unsqueeze(1) * h_post.unsqueeze(-1)      # (B, n, C)
+    return mixed + update
 
 
 # ==================== mHC 层内变换块 (论文 Eq.9 的 F(·, W_l)) ===========
@@ -45,49 +77,83 @@ class TransformBlock(nn.Module):
         return self.block(x)
 
 
-# ==================== mHC残差（无状态）====================
+# ==================== mHC残差（融合投影版）=======================
 class ManifoldConstrainedResidual(nn.Module):
+    """
+    Manifold-Constrained Hyper-Connection 单层。
+
+    v1.2 优化:
+      - 将 h_pre / h_post / h_res 三个独立 Linear 融合为单个 fused_proj,
+        输出 (2n + n²) 维向量，内部切片得到三组 logits。
+        效果: 3 次 GEMM → 1 次 GEMM，降低 MKL 启动开销。
+      - Sinkhorn 迭代交给 _sinkhorn_knopp_jit 处理。
+      - 末尾的 H_res·X + H_post·F(·) 合并交给 _fused_mhc_update 处理。
+    """
     def __init__(self, dim, n_streams=4):
         super().__init__()
         self.dim = dim
         self.n_streams = n_streams
 
-        self.h_pre_proj = nn.Linear(dim * n_streams, n_streams, bias=True)
-        self.h_post_proj = nn.Linear(dim * n_streams, n_streams, bias=True)
-        self.h_res_proj = nn.Linear(dim * n_streams, n_streams * n_streams, bias=True)
+        # ── 融合投影: [h_pre (n) | h_post (n) | h_res (n²)] ─────────
+        fused_out_dim = 2 * n_streams + n_streams * n_streams
+        self.fused_proj = nn.Linear(dim * n_streams, fused_out_dim, bias=True)
 
+        # 三个 alpha 独立 (初始 0.01, 保持训练早期 ≈ 均匀混合)
         self.alpha_pre = nn.Parameter(torch.tensor(0.01))
         self.alpha_post = nn.Parameter(torch.tensor(0.01))
         self.alpha_res = nn.Parameter(torch.tensor(0.01))
 
-        self.sinkhorn = SinkhornKnopp(n_iter=20)
+        self.sinkhorn_iters = 20
         self.norm = nn.LayerNorm(dim)
 
+        # 切片索引预计算
+        self._n = n_streams
+        self._slice_pre = slice(0, n_streams)
+        self._slice_post = slice(n_streams, 2 * n_streams)
+        self._slice_res = slice(2 * n_streams, 2 * n_streams + n_streams * n_streams)
+
     def forward(self, x, x_streams, layer_fn):
+        """
+        x         : (B, C)        当前主表示
+        x_streams : (B, n, C)     并行 streams (None 时用 x 初始化)
+        layer_fn  : callable      TransformBlock 实例 (论文 F(·,W_l))
+        """
         batch = x.size(0)
         if x_streams is None:
             x_streams = x.unsqueeze(1).repeat(1, self.n_streams, 1)
 
-        x_flat = x_streams.reshape(batch, -1)
+        # ── LayerNorm 在融合投影前 (保持 v1.2 的数值行为) ─────────
+        x_flat = x_streams.reshape(batch, -1)                    # (B, n·C)
         x_norm = F.layer_norm(x_flat, [x_flat.size(-1)])
 
-        h_pre = torch.sigmoid(self.alpha_pre * self.h_pre_proj(x_norm))
-        x_agg = torch.sum(h_pre.unsqueeze(-1) * x_streams, dim=1)
+        # ── 一次 GEMM 得到所有 logits ─────────────────────────────
+        fused_logits = self.fused_proj(x_norm)                   # (B, 2n + n²)
+        h_pre_logits  = fused_logits[:, self._slice_pre]          # (B, n)
+        h_post_logits = fused_logits[:, self._slice_post]         # (B, n)
+        h_res_logits  = fused_logits[:, self._slice_res].reshape(
+            batch, self._n, self._n
+        )                                                         # (B, n, n)
 
-        # ── 论文 Eq.9:  F(H_pre · X, W_l)  ──────────────────────────
-        out = layer_fn(self.norm(x_agg))
+        # ── 应用各自的 alpha 和激活 ──────────────────────────────
+        h_pre = torch.sigmoid(self.alpha_pre * h_pre_logits)
+        h_post = 2.0 * torch.sigmoid(self.alpha_post * h_post_logits)
+        h_res = _sinkhorn_knopp_jit(
+            self.alpha_res * h_res_logits, self.sinkhorn_iters
+        )
 
-        h_post = 2 * torch.sigmoid(self.alpha_post * self.h_post_proj(x_norm))
-        h_res_logits = self.alpha_res * self.h_res_proj(x_norm)
-        h_res = self.sinkhorn(h_res_logits.reshape(batch, self.n_streams, self.n_streams))
+        # ── Pre-aggregation: 论文 H_pre · X ─────────────────────
+        x_agg = (h_pre.unsqueeze(-1) * x_streams).sum(dim=1)      # (B, C)
 
-        mixed_streams = torch.matmul(h_res, x_streams)
-        updated_streams = mixed_streams + out.unsqueeze(1) * h_post.unsqueeze(-1)
+        # ── F(·, W_l) 变换 (论文 Eq.9) ──────────────────────────
+        out = layer_fn(self.norm(x_agg))                          # (B, C)
+
+        # ── 融合 H_res 混合 + H_post·F(·) + 残差合并 ────────────
+        updated_streams = _fused_mhc_update(x_streams, h_res, out, h_post)
 
         return updated_streams.mean(dim=1), updated_streams
 
 
-# ==================== Hyena卷积 ====================
+# ==================== Hyena卷积 (不变) ==========================
 class HyenaConvBlock(nn.Module):
     def __init__(self, dim, short_kernel=5, long_kernel=15, dropout=0.1):
         super().__init__()
@@ -115,7 +181,7 @@ class HyenaConvBlock(nn.Module):
         return res + out
 
 
-# ==================== 多尺度特征提取 ====================
+# ==================== 多尺度特征提取 (不变) =====================
 class MultiScaleFeatureExtractor(nn.Module):
     def __init__(self, input_dim=1024, hidden_dims=[512, 256, 128]):
         super().__init__()
@@ -140,16 +206,17 @@ class MultiScaleFeatureExtractor(nn.Module):
         return features
 
 
-# ==================== 自适应无监督编码器 ====================
+# ==================== 自适应无监督编码器 ========================
 class AdaptiveUnsupervisedEncoder(nn.Module):
     """
-    完全自适应的无监督编码器
-    不需要预设聚类数量，自动发现亚基因组结构
+    接口与 v1.2 完全相同:
+      - __init__(input_dim, hidden_dim, latent_dim, n_streams, n_layers, use_mhc)
+      - forward(x) → (recon, z_norm)
+      - predict_velocity(z_t, t) → v
 
-    v1.2 修正：
-      - mHC 的 layer_fn 使用 TransformBlock (FC+LN+GELU)，
-        而非 v1.1 中的 identity lambda。
-      - Decoder 使用对称 mHC 架构 (论文 §3.3.3)。
+    内部改动 (对用户透明):
+      - ManifoldConstrainedResidual 使用融合投影
+      - Sinkhorn 和 mHC 末端更新使用 @torch.jit.script
     """
     def __init__(self, input_dim=1024, hidden_dim=256, latent_dim=16,
                  n_streams=4, n_layers=3, use_mhc=True):
@@ -160,7 +227,6 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
 
-        # 多尺度特征
         self.feature_extractor = MultiScaleFeatureExtractor(
             input_dim=input_dim,
             hidden_dims=[hidden_dim * 2, hidden_dim, hidden_dim // 2]
@@ -174,25 +240,23 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
             nn.Dropout(0.1)
         )
 
-        # Hyena卷积
         self.hyena_blocks = nn.ModuleList([
             HyenaConvBlock(hidden_dim, short_kernel=5, long_kernel=15, dropout=0.1)
             for _ in range(n_layers)
         ])
 
-        # ── Encoder mHC ─────────────────────────────────────────────
+        # ── Encoder mHC ─────────────────────────────────────────
         if use_mhc:
             self.mhc_layers = nn.ModuleList([
                 ManifoldConstrainedResidual(hidden_dim, n_streams=n_streams)
                 for _ in range(n_layers)
             ])
-            # v1.2: 每层 mHC 配一个 TransformBlock 作为 layer_fn
             self.enc_transform_blocks = nn.ModuleList([
                 TransformBlock(hidden_dim, dropout=0.1)
                 for _ in range(n_layers)
             ])
 
-        # 瓶颈层
+        # ── Bottleneck ──────────────────────────────────────────
         self.bottleneck = nn.Sequential(
             nn.Linear(hidden_dim, latent_dim * 2),
             nn.LayerNorm(latent_dim * 2),
@@ -202,7 +266,7 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
             nn.Softplus()
         )
 
-        # Flow Matching
+        # ── Flow Matching ───────────────────────────────────────
         self.velocity_net = nn.Sequential(
             nn.Linear(latent_dim + 1, hidden_dim // 2),
             nn.Tanh(),
@@ -210,7 +274,7 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
             nn.Linear(hidden_dim // 2, latent_dim)
         )
 
-        # ── Decoder: 对称 mHC 网络 (论文 §3.3.3) ────────────────────
+        # ── Decoder: 对称 mHC 网络 (论文 §3.3.3) ────────────────
         self.dec_expand = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -234,15 +298,11 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
         )
 
     def forward(self, x):
-        batch = x.size(0)
-
-        # ── Encoder ──────────────────────────────────────────────────
-        # 特征提取
+        # ── Encoder ─────────────────────────────────────────────
         multi_feats = self.feature_extractor(x)
         fused = self.fusion(torch.cat(multi_feats, dim=-1))
         h = fused.unsqueeze(1)
 
-        # 编码
         if self.use_mhc:
             streams = fused.unsqueeze(1).repeat(1, self.n_streams, 1)
 
@@ -250,17 +310,16 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
             h = hyena_block(h)
             if self.use_mhc:
                 h_flat = h.squeeze(1)
-                # v1.2: 传入 TransformBlock 而非 identity lambda
                 h_flat, streams = self.mhc_layers[i](
                     h_flat, streams, self.enc_transform_blocks[i]
                 )
                 h = h_flat.unsqueeze(1)
 
-        # 潜在空间
+        # ── Latent ──────────────────────────────────────────────
         z = self.bottleneck(h.squeeze(1))
         z_norm = F.normalize(z, p=2, dim=1)
 
-        # ── Decoder (对称 mHC) ───────────────────────────────────────
+        # ── Decoder (对称 mHC) ──────────────────────────────────
         d = self.dec_expand(z)
 
         if self.use_mhc:
@@ -271,20 +330,19 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
                 )
 
         recon = self.dec_project(d)
-
         return recon, z_norm
 
     def predict_velocity(self, z_t, t):
         return self.velocity_net(torch.cat([z_t, t], dim=1))
 
 
-# ==================== 无监督损失函数 ====================
+# ==================== 无监督损失函数 (不变) =====================
 class AdaptiveLosses:
     """
     自适应无监督损失 —— v1.2 全部修正为论文公式
 
-    所有需要 window_ids 的损失函数现在接受 window_ids 参数，
-    通过 window_id 的前缀提取染色体名，按染色体计算质心。
+    所有需要 window_ids 的损失函数通过 window_id 的前缀提取染色体名,
+    按染色体计算质心。
     """
 
     @staticmethod
@@ -305,13 +363,8 @@ class AdaptiveLosses:
     @staticmethod
     def diversity_loss(z, window_ids):
         """
-        论文 Eq.7:
-          L_div = -(1 / (K(K-1))) Σ_{a≠b} ||z̄_a - z̄_b||_2
-
-        使用每条染色体的质心作为 "cluster centroid"，
-        最大化质心之间的平均 L2 距离，防止模式崩溃。
+        论文 Eq.7:  L_div = -(1/(K(K-1))) Σ_{a≠b} ||z̄_a - z̄_b||_2
         """
-        # ── 按染色体聚合质心 ──
         chrom_groups = {}
         for i, wid in enumerate(window_ids):
             chrom = wid.rpartition('_')[0]
@@ -326,14 +379,12 @@ class AdaptiveLosses:
         if len(centroids) < 2:
             return torch.tensor(0.0, device=z.device)
 
-        centroids_t = torch.stack(centroids)          # (K, d_z)
+        centroids_t = torch.stack(centroids)
         K = centroids_t.size(0)
 
-        # 计算所有质心对的 L2 距离
-        diffs = centroids_t.unsqueeze(0) - centroids_t.unsqueeze(1)  # (K, K, d_z)
-        dists = diffs.norm(p=2, dim=-1)                               # (K, K)
+        diffs = centroids_t.unsqueeze(0) - centroids_t.unsqueeze(1)
+        dists = diffs.norm(p=2, dim=-1)
 
-        # 去掉对角线，取平均，取负（最小化此 loss = 最大化距离）
         mask = 1 - torch.eye(K, device=z.device)
         mean_dist = (dists * mask).sum() / (K * (K - 1) + 1e-8)
 
@@ -341,26 +392,17 @@ class AdaptiveLosses:
 
     @staticmethod
     def local_smoothness_loss(z, window_ids):
-        """
-        论文 Eq.8:
-          L_smooth = (1/|A|) Σ_{(w, w+1)∈A} ||z_w - z_{w+1}||²
-
-        同一染色体的相邻窗口应该有相似的表示。
-        使用 L2² 而非余弦距离。
-        """
+        """论文 Eq.8:  L_smooth = (1/|A|) Σ ||z_w - z_{w+1}||²"""
         losses = []
 
-        # 按染色体分组
         chrom_groups = {}
         for i, wid in enumerate(window_ids):
             chrom = wid.rpartition('_')[0]
             chrom_groups.setdefault(chrom, []).append(i)
 
-        # 计算相邻窗口的 L2² 距离
         for chrom, indices in chrom_groups.items():
             if len(indices) < 2:
                 continue
-
             indices = sorted(indices)
             for j in range(len(indices) - 1):
                 idx1, idx2 = indices[j], indices[j + 1]
@@ -374,22 +416,12 @@ class AdaptiveLosses:
 
     @staticmethod
     def augmentation_consistency_loss(z1, z2):
-        """
-        论文 Eq.10:
-          L_aug = (1/B) Σ ||z_i - z_i^noisy||²
-
-        数据增强一致性，使用 L2² 而非余弦距离。
-        """
+        """论文 Eq.10:  L_aug = (1/B) Σ ||z_i - z_i^noisy||²"""
         return F.mse_loss(z1, z2)
 
     @staticmethod
     def spread_loss(z, window_ids):
-        """
-        论文 Eq.11:
-          L_spread = -Var({z̄_{chr_j}})
-
-        最大化每条染色体质心的方差，防止所有染色体坍缩到同一点。
-        """
+        """论文 Eq.11:  L_spread = -Var({z̄_{chr_j}})"""
         chrom_groups = {}
         for i, wid in enumerate(window_ids):
             chrom = wid.rpartition('_')[0]
@@ -404,8 +436,6 @@ class AdaptiveLosses:
         if len(centroids) < 2:
             return torch.tensor(0.0, device=z.device)
 
-        centroids_t = torch.stack(centroids)   # (N_chr, d_z)
-        # 计算所有维度上的总方差
+        centroids_t = torch.stack(centroids)
         var_total = centroids_t.var(dim=0).sum()
-
         return -var_total

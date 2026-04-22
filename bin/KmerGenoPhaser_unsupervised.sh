@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  KmerGenoPhaser_unsupervised.sh  —  v1.1  (2026-03-31)
+#  KmerGenoPhaser_unsupervised.sh  —  v1.2  (2026-04-22)
+#
+#  Changes from v1.1:
+#   - Pass-through of --num_workers / --num_threads for CPU data-parallel
+#     training. Backward compatible: if neither is provided, behaves
+#     identically to v1.1 (single-process training).
 # =============================================================================
 set -euo pipefail
 
@@ -33,6 +38,11 @@ MAX_KMER="${MAX_KMER:-5}"
 EPOCHS="${EPOCHS:-100000}"
 LATENT_DIM="${LATENT_DIM:-32}"
 THREADS="${THREADS:-20}"
+
+# ── v1.2 new: CPU data-parallel knobs (optional, no hardcoded default) ──
+# Leave empty → fall through to Python's auto-detect (KGP_NUM_*/cpu_count).
+NUM_WORKERS=""
+NUM_THREADS=""
 
 SKIP_CHECK_BLOCKS=false
 SKIP_KARYOTYPE=false
@@ -68,6 +78,25 @@ Training:
   --epochs         <int>       Training epochs (default: ${EPOCHS})
   --latent_dim     <int>       Latent space dimension (default: ${LATENT_DIM})
 
+CPU parallelism (v1.2, all optional — auto if unset):
+  --num_workers    <int>       Data-parallel worker processes
+                               (1 = single-process legacy mode)
+                               Override env: KGP_NUM_WORKERS
+  --num_threads    <int>       MKL/OMP threads per worker
+                               (0 = auto: cpu_count/num_workers,
+                                -1 = all CPUs)
+                               Override env: KGP_NUM_THREADS
+
+  Examples:
+    # legacy single-process:
+    (no flags, or)   --num_workers 1
+
+    # 4-way parallel on 64-core node, each worker gets 16 threads:
+    --num_workers 4  --num_threads 16
+
+    # 2-way parallel, auto thread split (32 each on 64-core):
+    --num_workers 2  --num_threads 0
+
 Visualization:
   --genome_title   <str>       Title for karyotype plots (default: species_name)
   --karyotype_colors <str>     "Name=#hex,Name2=#hex2" custom bloodline colors
@@ -77,7 +106,8 @@ Skip flags:
   --skip_check_blocks          Skip block vs FASTA length validation
   --skip_karyotype             Skip karyotype visualization (Step 5)
   --no_bloodline               Skip heatmap plotting
-  --threads        <int>       CPU threads (default: ${THREADS})
+  --threads        <int>       CPU threads for feature extraction steps
+                               (default: ${THREADS}; unrelated to --num_threads above)
 EOF
 }
 
@@ -104,6 +134,8 @@ while [[ $# -gt 0 ]]; do
         --max_kmer)          MAX_KMER="$2";           shift 2 ;;
         --epochs)            EPOCHS="$2";             shift 2 ;;
         --latent_dim)        LATENT_DIM="$2";         shift 2 ;;
+        --num_workers)       NUM_WORKERS="$2";        shift 2 ;;
+        --num_threads)       NUM_THREADS="$2";        shift 2 ;;
         --genome_title)      GENOME_TITLE="$2";       shift 2 ;;
         --karyotype_colors)  KARYOTYPE_COLORS="$2";   shift 2 ;;
         --centromere_file)   CENTROMERE_FILE="$2";    shift 2 ;;
@@ -171,9 +203,6 @@ OUTPUT_DIR="${WORK_DIR}/output/bloodline/${SPECIES_NAME}"
 mkdir -p "${PROCESS_DIR}" "${OUTPUT_DIR}"
 
 # ── Environment ───────────────────────────────────────────────────────────────
-# FIX: Only activate conda if the target environment is not already active.
-#      Double-activation (user script + this script) causes conda to exit
-#      the environment unexpectedly.
 MINICONDA_PATH="${MINICONDA_PATH:-${HOME}/miniconda3}"
 _TARGET_ENV="${CONDA_ENV:-kmer}"
 if [[ "${CONDA_DEFAULT_ENV:-}" != "${_TARGET_ENV}" ]]; then
@@ -190,7 +219,7 @@ fi
 read -r -a TARGET_CHROMS_ARRAY <<< "${TARGET_CHROMS}"
 
 echo "========================================================================"
-echo "  KmerGenoPhaser Unsupervised Pipeline  —  v1.1"
+echo "  KmerGenoPhaser Unsupervised Pipeline  —  v1.2"
 echo "========================================================================"
 echo "  Species       : ${SPECIES_NAME}"
 echo "  Target chroms : ${TARGET_CHROMS}"
@@ -202,6 +231,8 @@ echo "  Encoding      : ${ENCODING}"
     echo "  FFT size      : ${FFT_SIZE}"
 echo "  INPUT_DIM     : ${INPUT_DIM}  (auto-computed)"
 echo "  Epochs        : ${EPOCHS}"
+[[ -n "${NUM_WORKERS}" ]] && echo "  Num workers   : ${NUM_WORKERS}"
+[[ -n "${NUM_THREADS}" ]] && echo "  Threads/wkr   : ${NUM_THREADS}"
 echo "  Work dir      : ${WORK_DIR}"
 echo "========================================================================"
 
@@ -259,14 +290,36 @@ echo ""
 echo "[Step 2/5] Training autoencoder  (INPUT_DIM=${INPUT_DIM}, epochs=${EPOCHS}) …"
 DISTANCE_TSV="${PROCESS_DIR}/${SPECIES_NAME}_block_distances.tsv"
 
+# ── Build parallelism flags only if user explicitly set them ──
+# Empty → pass nothing, Python uses env vars / auto-detect
+PARALLEL_ARGS=()
+if [[ -n "${NUM_WORKERS}" ]]; then
+    PARALLEL_ARGS+=(--num_workers "${NUM_WORKERS}")
+fi
+if [[ -n "${NUM_THREADS}" ]]; then
+    PARALLEL_ARGS+=(--num_threads "${NUM_THREADS}")
+fi
+
+# ── DDP rendezvous file: avoids port conflicts across concurrent jobs ──
+# Unique per (species, job) because PROCESS_DIR is per-species and
+# PBS_JOBID (or shell PID as fallback) is per-job. Even if two qsub jobs
+# land on the same node, their rendezvous files differ.
+KGP_RENDEZVOUS="${PROCESS_DIR}/.kgp_rdzv_${PBS_JOBID:-$$}"
+export KGP_RENDEZVOUS
+rm -f "${KGP_RENDEZVOUS}"    # clean any stale file from a crashed previous run
+
 python "${SCRIPT_PY_DIR}/train_adaptive_unsupervised.py" \
     --input_pickle  "${FEATURES_PKL}" \
     --output_tsv    "${DISTANCE_TSV}" \
     --input_dim     "${INPUT_DIM}" \
     --latent_dim    "${LATENT_DIM}" \
     --epochs        "${EPOCHS}" \
+    "${PARALLEL_ARGS[@]}" \
     && echo "  ✓ Autoencoder training complete" \
     || { echo "  ✗ Training failed!" >&2; exit 1; }
+
+# Clean up rendezvous file (defensive; Python also cleans on normal exit)
+rm -f "${KGP_RENDEZVOUS}"
 
 # =============================================================================
 #  Steps 3-4
