@@ -16,13 +16,20 @@ v1.2 DDP 兼容性修复 (2026-04-22):
   - 函数保留纯 Python 实现, 在 MKL/oneDNN 下性能仍然可观。
   - 该修改与单进程模式 (num_workers=1) 完全兼容, 不改变数值行为。
 
-v1.3 (2026-04-24) 数值稳定性改进:
+v1.3 (2026-04-24) 数值稳定性 + GPU 兼容:
   - _sinkhorn_knopp 改为 log-domain 迭代: 用 logsumexp 做行/列归一化,
     最后一次性 exp。避免 torch.exp(alpha_res * logits) 在 alpha_res
-    训练中增大时产生的数值过冲。
-  - 数学上与 v1.2 完全等价 (都是 Sinkhorn 投影到 Birkhoff polytope),
-    在 float32 下结果差异量级 ~1e-7, 不影响训练动力学。
-  - 接口 (函数签名/返回形状) 与 v1.2 完全一致, 调用方无需修改。
+    训练中增大时产生的数值过冲。数学上与 v1.2 完全等价 (都是 Sinkhorn
+    投影到 Birkhoff polytope), 在 float32 下结果差异量级 ~1e-7, 不影响
+    训练动力学。接口 (函数签名/返回形状) 与 v1.2 完全一致。
+  - AdaptiveLosses.flow_matching_loss (legacy, DDP 路径未调用) 补
+    device=z.device: 旧写法在 GPU 上会产生 CPU tensor, 后续
+    (1-t)*z_0+t*z 会报 "Expected all tensors to be on the same device"
+    错误。DDP 训练路径用的是 forward() 里的 pred_v, 从不走这个函数,
+    所以之前 CPU-only 跑起来不会炸。修这里是为了让整个 API 都 device-safe。
+  - 所有 TransformBlock / mHC / Hyena / Encoder / Sinkhorn / Decoder
+    都是 device-agnostic 的 (只用 nn.Module / nn.Parameter, 以及
+    device=z.device 的 torch.eye 掩码), 无须改动即可 GPU 运行。
 """
 import os
 import torch
@@ -394,8 +401,11 @@ class AdaptiveLosses:
 
     @staticmethod
     def flow_matching_loss(model, z):
-        """保留旧接口 (单进程模式可用); DDP 训练路径走 forward() 里的 pred_v."""
-        t = torch.rand(z.size(0), 1)
+        """保留旧接口 (单进程模式可用); DDP 训练路径走 forward() 里的 pred_v.
+
+        v1.3: torch.rand 加 device=z.device, 否则 GPU 上会混合 CPU/GPU tensor。
+        """
+        t = torch.rand(z.size(0), 1, device=z.device)
         z_0 = torch.randn_like(z)
         z_t = (1 - t) * z_0 + t * z
         pred_v = model.predict_velocity(z_t, t)

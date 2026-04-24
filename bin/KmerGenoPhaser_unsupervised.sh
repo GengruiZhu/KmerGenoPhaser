@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  KmerGenoPhaser_unsupervised.sh  —  v1.2  (2026-04-22)
+#  KmerGenoPhaser_unsupervised.sh  —  v1.3  (2026-04-24)
 #
-#  Changes from v1.1:
-#   - Pass-through of --num_workers / --num_threads for CPU data-parallel
-#     training. Backward compatible: if neither is provided, behaves
-#     identically to v1.1 (single-process training).
+#  Changes from v1.2:
+#   - Pass-through of --device / --precision for CPU/GPU selection + AMP.
+#     Defaults (auto/auto) are backward compatible: existing invocations
+#     behave identically to v1.2 unless a GPU is present, in which case
+#     the Python trainer auto-picks CUDA (and bf16 on A100+/H100).
+#   - --num_workers retains v1.2 CPU semantics and additionally acts as
+#     "number of GPUs" in CUDA mode. Leave unset (or 0) in CUDA mode to
+#     auto-use all visible GPUs (respects CUDA_VISIBLE_DEVICES).
+#
+#  Defaults precedence:  CLI flag  >  conf/kmergenophaser.conf  >  built-in
 # =============================================================================
 set -euo pipefail
 
@@ -39,10 +45,14 @@ EPOCHS="${EPOCHS:-100000}"
 LATENT_DIM="${LATENT_DIM:-32}"
 THREADS="${THREADS:-20}"
 
-# ── v1.2 new: CPU data-parallel knobs (optional, no hardcoded default) ──
-# Leave empty → fall through to Python's auto-detect (KGP_NUM_*/cpu_count).
+# ── v1.2: CPU data-parallel knobs (optional, no hardcoded default) ──
 NUM_WORKERS=""
 NUM_THREADS=""
+
+# ── v1.3 new: device / precision overrides ──
+# Empty = fall through to config file (DEVICE/PRECISION) then Python auto.
+OVERRIDE_DEVICE=""
+OVERRIDE_PRECISION=""
 
 SKIP_CHECK_BLOCKS=false
 SKIP_KARYOTYPE=false
@@ -62,7 +72,7 @@ Required:
   --target_chroms  <str...>   Space-separated chromosome names to process
   --work_dir       <dir>      Working directory
 
-Feature extraction (v1.1):
+Feature extraction:
   --feature_mode   block|genome   block = per-block features (default)
                                   genome = sliding-window chromosome features
   --encoding       kmer|fft|concat  Encoding strategy (default: concat)
@@ -78,24 +88,45 @@ Training:
   --epochs         <int>       Training epochs (default: ${EPOCHS})
   --latent_dim     <int>       Latent space dimension (default: ${LATENT_DIM})
 
-CPU parallelism (v1.2, all optional — auto if unset):
-  --num_workers    <int>       Data-parallel worker processes
-                               (1 = single-process legacy mode)
+Hardware selection (v1.3):
+  --device         <str>       cpu | cuda | gpu | auto
+                               (default: from conf DEVICE, else 'auto')
+                                 cpu  : force CPU training (v1.2 behavior)
+                                 cuda : force GPU, error if unavailable
+                                        ('gpu' is an alias)
+                                 auto : CUDA if available, else CPU
+  --precision      <str>       fp32 | bf16 | auto
+                               (default: from conf PRECISION, else 'auto')
+                                 fp32 : full precision (CPU always)
+                                 bf16 : torch.autocast(bfloat16), no GradScaler
+                                 auto : bf16 on A100+/H100 (CC>=8.0), else fp32
+
+Parallelism (all optional — auto if unset):
+  --num_workers    <int>       CPU: data-parallel worker processes (default 1)
+                               CUDA: number of GPUs (0 = auto = all visible)
                                Override env: KGP_NUM_WORKERS
-  --num_threads    <int>       MKL/OMP threads per worker
+  --num_threads    <int>       MKL/OMP threads per worker (CPU mode only)
                                (0 = auto: cpu_count/num_workers,
                                 -1 = all CPUs)
                                Override env: KGP_NUM_THREADS
 
   Examples:
-    # legacy single-process:
-    (no flags, or)   --num_workers 1
+    # default: auto-detect GPU, auto-pick bf16 on A100+
+    (no flags)
 
-    # 4-way parallel on 64-core node, each worker gets 16 threads:
-    --num_workers 4  --num_threads 16
+    # force CPU, 4-way parallel with 16 MKL threads each (v1.2 style):
+    --device cpu --num_workers 4 --num_threads 16
 
-    # 2-way parallel, auto thread split (32 each on 64-core):
-    --num_workers 2  --num_threads 0
+    # force GPU, use all visible cards, auto bf16:
+    --device cuda
+
+    # force GPU, only first 2 cards, force fp32:
+    CUDA_VISIBLE_DEVICES=0,1 ... --device cuda --precision fp32
+
+    # multi-node: launch via torchrun, this script detects env and skips spawn
+    torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \\
+             --master_addr=node1 --master_port=29500 \\
+        KmerGenoPhaser_unsupervised.sh --device cuda ...
 
 Visualization:
   --genome_title   <str>       Title for karyotype plots (default: species_name)
@@ -136,6 +167,9 @@ while [[ $# -gt 0 ]]; do
         --latent_dim)        LATENT_DIM="$2";         shift 2 ;;
         --num_workers)       NUM_WORKERS="$2";        shift 2 ;;
         --num_threads)       NUM_THREADS="$2";        shift 2 ;;
+        # v1.3: device / precision
+        --device)            OVERRIDE_DEVICE="$2";    shift 2 ;;
+        --precision)         OVERRIDE_PRECISION="$2"; shift 2 ;;
         --genome_title)      GENOME_TITLE="$2";       shift 2 ;;
         --karyotype_colors)  KARYOTYPE_COLORS="$2";   shift 2 ;;
         --centromere_file)   CENTROMERE_FILE="$2";    shift 2 ;;
@@ -172,6 +206,25 @@ esac
 case "${FEATURE_MODE}" in
     block|genome) ;;
     *) echo "[ERROR] --feature_mode must be one of: block, genome" >&2; exit 1 ;;
+esac
+
+# ── v1.3: device & precision resolution (CLI > conf > Python default) ────────
+[[ -n "${OVERRIDE_DEVICE}"    ]] && DEVICE="${OVERRIDE_DEVICE}"
+[[ -n "${OVERRIDE_PRECISION}" ]] && PRECISION="${OVERRIDE_PRECISION}"
+DEVICE="${DEVICE:-auto}"
+PRECISION="${PRECISION:-auto}"
+
+# Normalize 'gpu' → 'cuda' for consistent downstream checks (Python also does
+# this; we pre-normalize to make the shell-side detection below cleaner).
+[[ "${DEVICE,,}" == "gpu" ]] && DEVICE="cuda"
+
+case "${DEVICE,,}" in
+    cpu|cuda|auto) ;;
+    *) echo "[ERROR] --device must be one of: cpu, cuda, gpu, auto (got: ${DEVICE})" >&2; exit 1 ;;
+esac
+case "${PRECISION,,}" in
+    fp32|bf16|auto) ;;
+    *) echo "[ERROR] --precision must be one of: fp32, bf16, auto (got: ${PRECISION})" >&2; exit 1 ;;
 esac
 
 INPUT_DIM=$(python3 - <<PYEOF
@@ -216,10 +269,24 @@ else
     echo "[INFO] Conda environment already active: ${CONDA_DEFAULT_ENV} — skipping activation"
 fi
 
+# ── v1.3: shell-side device probe (for banner + graceful fallback warning) ──
+_HAS_CUDA=false
+if [[ "${DEVICE}" != "cpu" ]] && command -v nvidia-smi &>/dev/null; then
+    if nvidia-smi -L 2>/dev/null | grep -qi "GPU"; then
+        _HAS_CUDA=true
+    fi
+fi
+
+if [[ "${DEVICE}" == "cuda" && "${_HAS_CUDA}" == "false" ]]; then
+    echo "[WARN] --device cuda requested but nvidia-smi shows no GPU." >&2
+    echo "       Python will raise RuntimeError at startup." >&2
+    echo "       (Use --device auto if you want graceful fallback to CPU.)" >&2
+fi
+
 read -r -a TARGET_CHROMS_ARRAY <<< "${TARGET_CHROMS}"
 
 echo "========================================================================"
-echo "  KmerGenoPhaser Unsupervised Pipeline  —  v1.2"
+echo "  KmerGenoPhaser Unsupervised Pipeline  —  v1.3"
 echo "========================================================================"
 echo "  Species       : ${SPECIES_NAME}"
 echo "  Target chroms : ${TARGET_CHROMS}"
@@ -231,8 +298,10 @@ echo "  Encoding      : ${ENCODING}"
     echo "  FFT size      : ${FFT_SIZE}"
 echo "  INPUT_DIM     : ${INPUT_DIM}  (auto-computed)"
 echo "  Epochs        : ${EPOCHS}"
+echo "  Device req    : ${DEVICE}   (nvidia-smi GPU detected: ${_HAS_CUDA})"
+echo "  Precision req : ${PRECISION}"
 [[ -n "${NUM_WORKERS}" ]] && echo "  Num workers   : ${NUM_WORKERS}"
-[[ -n "${NUM_THREADS}" ]] && echo "  Threads/wkr   : ${NUM_THREADS}"
+[[ -n "${NUM_THREADS}" ]] && echo "  Threads/wkr   : ${NUM_THREADS} (CPU mode only)"
 echo "  Work dir      : ${WORK_DIR}"
 echo "========================================================================"
 
@@ -290,8 +359,8 @@ echo ""
 echo "[Step 2/5] Training autoencoder  (INPUT_DIM=${INPUT_DIM}, epochs=${EPOCHS}) …"
 DISTANCE_TSV="${PROCESS_DIR}/${SPECIES_NAME}_block_distances.tsv"
 
-# ── Build parallelism flags only if user explicitly set them ──
-# Empty → pass nothing, Python uses env vars / auto-detect
+# ── Build parallelism + hardware flags only if user explicitly set them ──
+# Empty → pass nothing, Python uses env vars / conf / auto-detect
 PARALLEL_ARGS=()
 if [[ -n "${NUM_WORKERS}" ]]; then
     PARALLEL_ARGS+=(--num_workers "${NUM_WORKERS}")
@@ -299,11 +368,15 @@ fi
 if [[ -n "${NUM_THREADS}" ]]; then
     PARALLEL_ARGS+=(--num_threads "${NUM_THREADS}")
 fi
+# v1.3: always pass --device and --precision (resolved above with conf fallback)
+PARALLEL_ARGS+=(--device "${DEVICE}")
+PARALLEL_ARGS+=(--precision "${PRECISION}")
 
 # ── DDP rendezvous file: avoids port conflicts across concurrent jobs ──
 # Unique per (species, job) because PROCESS_DIR is per-species and
 # PBS_JOBID (or shell PID as fallback) is per-job. Even if two qsub jobs
 # land on the same node, their rendezvous files differ.
+# Note: torchrun-launched multi-node runs use env:// instead and ignore this.
 KGP_RENDEZVOUS="${PROCESS_DIR}/.kgp_rdzv_${PBS_JOBID:-$$}"
 export KGP_RENDEZVOUS
 rm -f "${KGP_RENDEZVOUS}"    # clean any stale file from a crashed previous run
@@ -391,4 +464,5 @@ echo "========================================================================"
 echo "  Pipeline complete."
 echo "  OUTPUT_DIR : ${OUTPUT_DIR}"
 echo "  INPUT_DIM used: ${INPUT_DIM}"
+echo "  Device    : ${DEVICE}    Precision: ${PRECISION}"
 echo "========================================================================"
