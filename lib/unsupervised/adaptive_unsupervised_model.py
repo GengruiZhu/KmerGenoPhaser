@@ -12,11 +12,17 @@ v1.2 内容 (保留):
 v1.2 DDP 兼容性修复 (2026-04-22):
   - 摘掉 _sinkhorn_knopp / _fused_mhc_update 上的 @torch.jit.script。
     原因: PyTorch 2.6 在 DDP 包装下, JIT script 化的函数 + autograd
-    backward 组合会触发 "Schema not found for node" 错误 (具体是
-    TorchScript 在 backward 里插入的 _size_if_not_equal 辅助算子
-    找不到 schema)。
+    backward 组合会触发 "Schema not found for node" 错误。
   - 函数保留纯 Python 实现, 在 MKL/oneDNN 下性能仍然可观。
   - 该修改与单进程模式 (num_workers=1) 完全兼容, 不改变数值行为。
+
+v1.3 (2026-04-24) 数值稳定性改进:
+  - _sinkhorn_knopp 改为 log-domain 迭代: 用 logsumexp 做行/列归一化,
+    最后一次性 exp。避免 torch.exp(alpha_res * logits) 在 alpha_res
+    训练中增大时产生的数值过冲。
+  - 数学上与 v1.2 完全等价 (都是 Sinkhorn 投影到 Birkhoff polytope),
+    在 float32 下结果差异量级 ~1e-7, 不影响训练动力学。
+  - 接口 (函数签名/返回形状) 与 v1.2 完全一致, 调用方无需修改。
 """
 import os
 import torch
@@ -33,14 +39,22 @@ import torch.nn.functional as F
 def _sinkhorn_knopp(logits: torch.Tensor, n_iters: int = 20) -> torch.Tensor:
     """
     论文 Eq.9 的 Sinkhorn-Knopp 迭代, 20 次行/列交替归一化。
-    输入 logits 是未归一化的原始矩阵 (batch, n, n)。
+
+    v1.3: 改为 log-domain 实现。
+      - 原 v1.2: m = exp(logits); 然后反复 m /= m.sum(-1) 和 m /= m.sum(-2)
+      - v1.3:   log_m = logits; 反复 log_m -= logsumexp(log_m, -1); 最后 exp
+      - 数学等价, float32 下数值更稳 (避免 exp 过冲), 返回形状/语义不变。
+
+    输入 logits 形如 (B, n, n), 未归一化。
+    输出一个近似双随机矩阵, 行列和 ≈ 1。
     """
-    eps = 1e-8
-    m = torch.exp(logits)
+    log_m = logits
     for _ in range(n_iters):
-        m = m / (m.sum(dim=-1, keepdim=True) + eps)   # row normalize
-        m = m / (m.sum(dim=-2, keepdim=True) + eps)   # col normalize
-    return m
+        # row normalize:   log(M_ij / sum_j M_ij) = log M_ij - logsumexp_j log M_ij
+        log_m = log_m - torch.logsumexp(log_m, dim=-1, keepdim=True)
+        # col normalize
+        log_m = log_m - torch.logsumexp(log_m, dim=-2, keepdim=True)
+    return torch.exp(log_m)
 
 
 def _fused_mhc_update(
@@ -267,7 +281,12 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
             nn.Sigmoid()
         )
 
-    def forward(self, x):
+    def _encode(self, x):
+        """
+        Encoder-only 路径 (feature extractor + Hyena + mHC + bottleneck)。
+        返回 (z, z_norm), 不走 decoder。供 augmentation consistency loss 使用,
+        省一次 decoder forward。
+        """
         multi_feats = self.feature_extractor(x)
         fused = self.fusion(torch.cat(multi_feats, dim=-1))
         h = fused.unsqueeze(1)
@@ -286,26 +305,88 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
 
         z = self.bottleneck(h.squeeze(1))
         z_norm = F.normalize(z, p=2, dim=1)
+        return z, z_norm
 
+    def _decode(self, z):
+        """
+        Decoder-only 路径 (expand + 对称 mHC + project)。
+        """
         d = self.dec_expand(z)
-
         if self.use_mhc:
             d_streams = d.unsqueeze(1).repeat(1, self.n_streams, 1)
             for i in range(self.n_layers):
                 d, d_streams = self.dec_mhc_layers[i](
                     d, d_streams, self.dec_transform_blocks[i]
                 )
+        return self.dec_project(d)
 
-        recon = self.dec_project(d)
-        return recon, z_norm
+    def forward(self, x, x_aug=None, t=None, z_0=None):
+        """
+        统一前向。支持两种调用模式:
+
+        1) 传统/推理模式 (x_aug/t/z_0 均为 None):
+             returns (recon, z_norm)
+           与 v1.1/v1.2 行为完全一致, 保证下游代码 (evaluate() 等) 无需改动。
+
+        2) 训练模式 (传入 x_aug, t, z_0):
+             returns dict {
+                'recon'   : (B, input_dim)    from x
+                'z'       : (B, latent_dim)   from x
+                'z_aug'   : (B, latent_dim)   from x_aug, encoder-only
+                'pred_v'  : (B, latent_dim)   velocity_net(interp(z_0, z), t)
+             }
+           所有张量都在一次 DDP-wrapped forward 里产生, 反向时
+           DDP reducer 只处理一个一致的梯度图, 消除 "marked ready twice"
+           及 "finished reduction in prior iteration" 类错误。
+
+        训练模式下 l_recon 用 recon; l_fm 用 pred_v 和 (z - z_0);
+        l_aug 用 z 和 z_aug; l_diversity/smoothness/spread 用 z。
+        """
+        # ── 主路径: encode + decode ──
+        z_raw, z_norm = self._encode(x)
+        recon = self._decode(z_raw)
+
+        # ── 传统调用: 保持 (recon, z_norm) 返回值 ──
+        if x_aug is None and t is None and z_0 is None:
+            return recon, z_norm
+
+        out = {'recon': recon, 'z': z_norm}
+
+        # ── 增强路径: 只跑 encoder, 不必再跑 decoder (consistency 只看 z) ──
+        if x_aug is not None:
+            _, z_aug = self._encode(x_aug)
+            out['z_aug'] = z_aug
+
+        # ── flow matching: velocity 预测 ──
+        if t is not None and z_0 is not None:
+            z_t = (1.0 - t) * z_0 + t * z_norm
+            pred_v = self.velocity_net(torch.cat([z_t, t], dim=1))
+            out['pred_v'] = pred_v
+
+        return out
 
     def predict_velocity(self, z_t, t):
+        """保留旧接口, 供单进程推理使用。DDP 训练路径应走 forward()."""
         return self.velocity_net(torch.cat([z_t, t], dim=1))
 
 
 # ==================== 无监督损失函数 ============================
 class AdaptiveLosses:
-    """自适应无监督损失 —— v1.2 全部对齐论文公式"""
+    """
+    自适应无监督损失 —— v1.2 全部对齐论文公式。
+
+    DDP-safe 注意事项:
+      退化情况 (e.g. batch 里只有 1 个 chromosome) 返回 `z.sum() * 0.0`
+      而非 `torch.tensor(0.0)`。前者保持计算图连通 (grad 值为 0 但
+      autograd 能 traverse), 后者是常量会让 DDP 不同 rank 的计算图
+      不对称, 触发 "marked ready twice" 或 "prior iteration reduction"
+      类错误。
+    """
+
+    @staticmethod
+    def _zero_like(z):
+        """Graph-connected zero scalar: grad flows through with value 0."""
+        return z.sum() * 0.0
 
     @staticmethod
     def reconstruction_loss(recon, x):
@@ -313,6 +394,7 @@ class AdaptiveLosses:
 
     @staticmethod
     def flow_matching_loss(model, z):
+        """保留旧接口 (单进程模式可用); DDP 训练路径走 forward() 里的 pred_v."""
         t = torch.rand(z.size(0), 1)
         z_0 = torch.randn_like(z)
         z_t = (1 - t) * z_0 + t * z
@@ -334,7 +416,7 @@ class AdaptiveLosses:
             centroids.append(centroid)
 
         if len(centroids) < 2:
-            return torch.tensor(0.0, device=z.device)
+            return AdaptiveLosses._zero_like(z)
 
         centroids_t = torch.stack(centroids)
         K = centroids_t.size(0)
@@ -364,7 +446,7 @@ class AdaptiveLosses:
         if losses:
             return torch.stack(losses).mean()
         else:
-            return torch.tensor(0.0, device=z.device)
+            return AdaptiveLosses._zero_like(z)
 
     @staticmethod
     def augmentation_consistency_loss(z1, z2):
@@ -384,7 +466,7 @@ class AdaptiveLosses:
             centroids.append(centroid)
 
         if len(centroids) < 2:
-            return torch.tensor(0.0, device=z.device)
+            return AdaptiveLosses._zero_like(z)
 
         centroids_t = torch.stack(centroids)
         var_total = centroids_t.var(dim=0).sum()

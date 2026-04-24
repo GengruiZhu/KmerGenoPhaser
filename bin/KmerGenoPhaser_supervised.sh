@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# KmerGenoPhaser_supervised.sh
+# KmerGenoPhaser_supervised.sh   —   v1.3 (2026-04-24)
 # K-mer specificity scoring + genome mapping + visualization + block output.
 #
 # Pipeline:
@@ -12,6 +12,14 @@
 #   Step 3  → map_kmers_to_genome.py     (map k-mers onto target genome)
 #   Step 3.5→ mapping_counts_to_blocks.py (counts TSV → block .txt files)
 #   Step 4  → vis_supervised.R           (visualization)
+#
+# v1.2.2 changes:
+#   - Expose the three distance weights (--weight_euc, --weight_cos,
+#     --weight_min) and the Minkowski order (--minkowski_p) from the
+#     scoring step to the CLI, matching the formula in paper §4.2.5:
+#         Score(k) = (α·D_Euc + β·D_Cos + γ·D_Min) × ln(1 + cnt(k))
+#     Defaults (0.4, 0.4, 0.2, p=2) reproduce the sugarcane-tuned weights.
+#   - No other behavioural changes; existing command lines continue to work.
 # =============================================================================
 set -euo pipefail
 
@@ -53,6 +61,20 @@ Optional — k-mer pipeline:
   --window_size    <int>    Mapping window size in bp (default: 100000)
   --skip_mapping            Skip Step 3, reuse existing mapping tables
 
+Optional — v1.3 specificity scoring weights (paper §4.2.5):
+  Score(k) = (α·D_Euc + β·D_Cos + γ·D_Min) × ln(1 + cnt(k))
+  --weight_euc     <float>  α: Euclidean distance weight   (default: 0.4)
+  --weight_cos     <float>  β: Cosine distance weight      (default: 0.4)
+  --weight_min     <float>  γ: Minkowski distance weight   (default: 0.2)
+  --minkowski_p    <int>    Minkowski order p              (default: 2)
+                            p=2 → Minkowski ≡ Euclidean
+                            p=3,4 emphasises high-divergence positions
+
+  The defaults (0.4, 0.4, 0.2, p=2) were tuned on hybrid sugarcane
+  (XTT22) and form a broad plateau of near-maximal AUROC. For species
+  with very different progenitor divergence (e.g. wheat AABBDD vs.
+  cotton AADD), retune via grid search on a labelled subset.
+
 Optional — block output (Step 3.5):
   --skip_blocks             Skip block file generation after mapping
   --dominance_thr  <float>  Min species fraction to call a block (default: 0.55)
@@ -80,6 +102,9 @@ KMER_SOURCE="auto"; ORA_TOP_PCT="0.5"
 OVERRIDE_K=""; OVERRIDE_THREADS=""; OVERRIDE_MIN_COUNT=""
 OVERRIDE_MIN_SCORE=""; OVERRIDE_TOP_PCT=""; OVERRIDE_KMC_MEM=""
 OVERRIDE_WINDOW_SIZE=""
+# v1.3: scoring weights overrides (empty = use config file or built-in defaults)
+OVERRIDE_WEIGHT_EUC=""; OVERRIDE_WEIGHT_COS=""; OVERRIDE_WEIGHT_MIN=""
+OVERRIDE_MINKOWSKI_P=""
 SKIP_MAPPING=0; SKIP_BLOCKS=0; SKIP_VIS=0
 DOMINANCE_THR="0.55"; MIN_COUNTS="10"
 SPECIES_COLORS=""; SPECIES_COLS=""; GENOME_TITLE=""
@@ -102,6 +127,11 @@ while [[ $# -gt 0 ]]; do
     --top_pct)        OVERRIDE_TOP_PCT="$2";    shift 2 ;;
     --kmc_memory)     OVERRIDE_KMC_MEM="$2";    shift 2 ;;
     --window_size)    OVERRIDE_WINDOW_SIZE="$2"; shift 2 ;;
+    # v1.3: three-metric scoring weights
+    --weight_euc)     OVERRIDE_WEIGHT_EUC="$2"; shift 2 ;;
+    --weight_cos)     OVERRIDE_WEIGHT_COS="$2"; shift 2 ;;
+    --weight_min)     OVERRIDE_WEIGHT_MIN="$2"; shift 2 ;;
+    --minkowski_p)    OVERRIDE_MINKOWSKI_P="$2"; shift 2 ;;
     --skip_mapping)   SKIP_MAPPING=1;           shift ;;
     --skip_blocks)    SKIP_BLOCKS=1;            shift ;;
     --skip_vis)       SKIP_VIS=1;               shift ;;
@@ -139,9 +169,21 @@ fi
 [[ -n "$OVERRIDE_KMC_MEM"     ]] && KMC_MEMORY="$OVERRIDE_KMC_MEM"
 [[ -n "$OVERRIDE_WINDOW_SIZE" ]] && WINDOW_SIZE="$OVERRIDE_WINDOW_SIZE"
 
+# v1.3: weight overrides (CLI > config > built-in default)
+[[ -n "$OVERRIDE_WEIGHT_EUC"  ]] && WEIGHT_EUC="$OVERRIDE_WEIGHT_EUC"
+[[ -n "$OVERRIDE_WEIGHT_COS"  ]] && WEIGHT_COS="$OVERRIDE_WEIGHT_COS"
+[[ -n "$OVERRIDE_WEIGHT_MIN"  ]] && WEIGHT_MIN="$OVERRIDE_WEIGHT_MIN"
+[[ -n "$OVERRIDE_MINKOWSKI_P" ]] && MINKOWSKI_P="$OVERRIDE_MINKOWSKI_P"
+
 K="${K:-21}"; THREADS="${THREADS:-20}"; MIN_COUNT="${MIN_COUNT:-50}"
 TOP_PCT="${TOP_PCT:-0.5}"; MIN_SCORE="${MIN_SCORE:-0.9}"
 KMC_MEMORY="${KMC_MEMORY:-250}"; WINDOW_SIZE="${WINDOW_SIZE:-100000}"
+
+# v1.3 defaults (paper §4.2.5, sugarcane-tuned plateau):
+WEIGHT_EUC="${WEIGHT_EUC:-0.4}"
+WEIGHT_COS="${WEIGHT_COS:-0.4}"
+WEIGHT_MIN="${WEIGHT_MIN:-0.2}"
+MINKOWSKI_P="${MINKOWSKI_P:-2}"
 
 # ── Validate required ─────────────────────────────────────────────────────────
 for var in TARGET_GENOME SPECIES_NAMES READ_DIRS WORK_DIR; do
@@ -237,9 +279,10 @@ get_genome_size_mb() {
 GENOME_SIZE_MB=$(get_genome_size_mb "$TARGET_GENOME")
 
 echo "========================================================================"
-echo "KmerGenoPhaser — Supervised K-mer Module"
+echo "KmerGenoPhaser — Supervised K-mer Module (v1.3)"
 echo "  K=${K}  | read_format=${READ_FORMAT}  | window=${WINDOW_SIZE} bp"
 echo "  kmer_source=${KMER_SOURCE}  | genome_size=${GENOME_SIZE_MB} Mb"
+echo "  Scoring weights: α(Euc)=${WEIGHT_EUC}  β(Cos)=${WEIGHT_COS}  γ(Min)=${WEIGHT_MIN}  p=${MINKOWSKI_P}"
 printf "  Species (%d):\n" "${#SP_ARR[@]}"
 for i in "${!SP_ARR[@]}"; do
   printf "    [%d] %-20s  ←  %s\n" "$((i+1))" "${SP_ARR[$i]}" "${DIR_ARR[$i]}"
@@ -302,10 +345,11 @@ for i in "${!SP_ARR[@]}"; do
 done
 
 # ============================================================================
-# Step 1: Specificity scoring
+# Step 1: Specificity scoring (v1.3: three-metric composite)
 # ============================================================================
 echo ""
 echo ">>> Step 1: Specificity Scoring..."
+echo "    weights: α=${WEIGHT_EUC} β=${WEIGHT_COS} γ=${WEIGHT_MIN}  (Minkowski p=${MINKOWSKI_P})"
 
 for SP in "${SP_ARR[@]}"; do
   OTHERS=$(build_others "$SP")
@@ -319,7 +363,11 @@ for SP in "${SP_ARR[@]}"; do
       --species       "$SP" \
       --other_species "$OTHERS" \
       --k             "$K" \
-      --top_percent   "$TOP_PCT"
+      --top_percent   "$TOP_PCT" \
+      --weight_euc    "$WEIGHT_EUC" \
+      --weight_cos    "$WEIGHT_COS" \
+      --weight_min    "$WEIGHT_MIN" \
+      --minkowski_p   "$MINKOWSKI_P"
     echo "  [done] $SP scored."
   fi
 done
@@ -534,10 +582,11 @@ fi
 echo ""
 echo "========================================================================"
 echo "SUPERVISED MODULE COMPLETED"
-echo "  K-mer source  : $KMER_SOURCE (actual per-species: see above)"
-echo "  K-mer tables  : $TABLE_OUT"
-echo "  Block files   : $BLOCK_OUT"
-echo "  Plots         : $VIS_OUT"
+echo "  K-mer source     : $KMER_SOURCE (actual per-species: see above)"
+echo "  Scoring weights  : α=${WEIGHT_EUC}  β=${WEIGHT_COS}  γ=${WEIGHT_MIN}  p=${MINKOWSKI_P}"
+echo "  K-mer tables     : $TABLE_OUT"
+echo "  Block files      : $BLOCK_OUT"
+echo "  Plots            : $VIS_OUT"
 echo ""
 echo "  → Feed blocks into unsupervised module:"
 echo "     KmerGenoPhaser unsupervised --block_dir ${BLOCK_OUT} ..."
