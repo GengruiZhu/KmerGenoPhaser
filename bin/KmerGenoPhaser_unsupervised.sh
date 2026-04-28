@@ -43,6 +43,12 @@ MIN_KMER="${MIN_KMER:-1}"
 MAX_KMER="${MAX_KMER:-5}"
 EPOCHS="${EPOCHS:-100000}"
 LATENT_DIM="${LATENT_DIM:-32}"
+HIDDEN_DIM="${HIDDEN_DIM:-256}"
+N_STREAMS="${N_STREAMS:-4}"
+N_LAYERS="${N_LAYERS:-3}"
+LEARNING_RATE="${LEARNING_RATE:-0.0003}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-500}"
 THREADS="${THREADS:-20}"
 
 # ── v1.2: CPU data-parallel knobs (optional, no hardcoded default) ──
@@ -85,8 +91,14 @@ Feature extraction:
   --genome_window  <int>       Window size for genome mode (default: ${GENOME_WINDOW_SIZE})
 
 Training:
-  --epochs         <int>       Training epochs (default: ${EPOCHS})
-  --latent_dim     <int>       Latent space dimension (default: ${LATENT_DIM})
+  --epochs              <int>  Training epochs (default: ${EPOCHS})
+  --latent_dim          <int>  Latent space dimension (default: ${LATENT_DIM})
+  --hidden_dim          <int>  Hidden layer dimension (default: ${HIDDEN_DIM})
+  --n_streams           <int>  Number of mHC streams (default: ${N_STREAMS})
+  --n_layers            <int>  Number of Hyena + mHC layers (default: ${N_LAYERS})
+  --lr                  <float> Learning rate (default: ${LEARNING_RATE})
+  --batch_size          <int>  Per-worker micro-batch size (default: ${BATCH_SIZE})
+  --early_stop_patience <int>  Per-phase early-stop patience in epochs (default: ${EARLY_STOP_PATIENCE})
 
 Hardware selection (v1.3):
   --device         <str>       cpu | cuda | gpu | auto
@@ -165,6 +177,12 @@ while [[ $# -gt 0 ]]; do
         --max_kmer)          MAX_KMER="$2";           shift 2 ;;
         --epochs)            EPOCHS="$2";             shift 2 ;;
         --latent_dim)        LATENT_DIM="$2";         shift 2 ;;
+        --hidden_dim)        HIDDEN_DIM="$2";         shift 2 ;;
+        --n_streams)         N_STREAMS="$2";          shift 2 ;;
+        --n_layers)          N_LAYERS="$2";           shift 2 ;;
+        --lr)                LEARNING_RATE="$2";      shift 2 ;;
+        --batch_size)        BATCH_SIZE="$2";         shift 2 ;;
+        --early_stop_patience) EARLY_STOP_PATIENCE="$2"; shift 2 ;;
         --num_workers)       NUM_WORKERS="$2";        shift 2 ;;
         --num_threads)       NUM_THREADS="$2";        shift 2 ;;
         # v1.3: device / precision
@@ -382,11 +400,17 @@ export KGP_RENDEZVOUS
 rm -f "${KGP_RENDEZVOUS}"    # clean any stale file from a crashed previous run
 
 python "${SCRIPT_PY_DIR}/train_adaptive_unsupervised.py" \
-    --input_pickle  "${FEATURES_PKL}" \
-    --output_tsv    "${DISTANCE_TSV}" \
-    --input_dim     "${INPUT_DIM}" \
-    --latent_dim    "${LATENT_DIM}" \
-    --epochs        "${EPOCHS}" \
+    --input_pickle         "${FEATURES_PKL}" \
+    --output_tsv           "${DISTANCE_TSV}" \
+    --input_dim            "${INPUT_DIM}" \
+    --latent_dim           "${LATENT_DIM}" \
+    --hidden_dim           "${HIDDEN_DIM}" \
+    --n_streams            "${N_STREAMS}" \
+    --n_layers             "${N_LAYERS}" \
+    --epochs               "${EPOCHS}" \
+    --lr                   "${LEARNING_RATE}" \
+    --batch_size           "${BATCH_SIZE}" \
+    --early_stop_patience  "${EARLY_STOP_PATIENCE}" \
     "${PARALLEL_ARGS[@]}" \
     && echo "  ✓ Autoencoder training complete" \
     || { echo "  ✗ Training failed!" >&2; exit 1; }
@@ -466,3 +490,4 @@ echo "  OUTPUT_DIR : ${OUTPUT_DIR}"
 echo "  INPUT_DIM used: ${INPUT_DIM}"
 echo "  Device    : ${DEVICE}    Precision: ${PRECISION}"
 echo "========================================================================"
+

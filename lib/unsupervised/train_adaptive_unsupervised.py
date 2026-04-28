@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-自适应无监督训练 —— v1.3 CPU 数据并行版
+自适应无监督训练 —— v1.3.1 CPU 数据并行版
 
 v1.2 设计原则 (保留):
   1. 零硬编码: 线程/进程数全部通过 CLI 或 env 配置
@@ -9,57 +9,99 @@ v1.2 设计原则 (保留):
      backend 的 all_reduce 同步梯度
   4. NUMA 友好: 每个 worker 自动绑定到连续的 CPU 核子集
 
-v1.3 (2026-04-24) 内部优化 (CLI 接口不变, 与 v1.2 完全兼容):
+v1.3 (2026-04-24) 内部优化 (CLI 接口不变):
+  - patience 按 epoch 计数 (旧版按 evaluate 次数, 等效要 25000 epoch 无改善
+    才停, 默认 18000 epoch 训练永不触发)
+  - set_num_interop_threads 容错
+  - 惰性计算权重为 0 的损失
+  - best_state 同步落盘 (best_checkpoint.pt)
+  - 标准化换成 torch 原生
 
-  [BUG-FIX] Phase 3 早停语义对齐论文
-    - v1.2: patience 在每次 evaluate (每 50 epoch) 时累加, default=500
-      导致实际需要 500 × 50 = 25000 epoch 无提升才触发,
-      而默认 total_epochs=18000, 所以早停永远不会发生。
-    - v1.3: patience 按 epoch 计数, 在每次 evaluate 改善时清零。
-      default 500 = "连续 500 epoch 无提升才停", 匹配论文 §4.5.5 描述。
+v1.3 (2026-04-27) 关键 BUG-FIX —— 与 model.py 配套:
+  - hyena 死代码导致的 70+ 小时空转 (model.py 已修复主因)
+  - find_unused_parameters: True → False
+  - 默认关掉 TORCH_DISTRIBUTED_DEBUG (528 MB 日志噪声)
 
-  [ROBUSTNESS] set_num_interop_threads 容错
-    - v1.2: 直接调用, 在 import 顺序下偶尔抛 RuntimeError 导致启动失败。
-    - v1.3: try/except 包裹, 已初始化时静默跳过。
+═══════════════════════════════════════════════════════════════════════════
+v1.3.1 (2026-04-28) 训练动力学修复 —— 4 个真 BUG:
+═══════════════════════════════════════════════════════════════════════════
 
-  [PERF] 惰性计算权重为 0 的损失
-    - v1.2: Phase 1/2 中 weight=0 的 diversity/smoothness/spread 仍被计算,
-      在大批量下浪费时间。
-    - v1.3: 仅在对应权重 > 0 时计算, 否则使用图连通的 zero-like 张量填位。
-      DDP anchor 仍然保留所有输出张量, 不影响 reducer ready-flag 一致性。
+  ── 现象 ────────────────────────────────────────────────────────────────
+    EPOCHS=100000, LR=0.0001, early_stop_patience=1000 配置下:
+      * 训练跑到 8000 epoch 还在 Phase 1 (因为 Phase 1 = 33333 epoch)
+      * Pat=7949/1000 但训练不停
+      * LR 已经掉到 1e-6 地板 (从 epoch ~3000 开始)
+      * K=2 + 几乎所有染色体都进 Subgenome 0
+      * best Sil 是 epoch 51 的 0.5674, 之后再没改善过
+    用户反馈: "之前也是很高的初始 epoch, 但是早停会在 loss 不怎么动的
+    时候就退出啊", 即旧版本至少早停是有用的。
 
-  [CHECKPOINTING] best_state 同步落盘
-    - v1.2: 最优权重仅保存在 self.best_state 内存中, 训练崩溃即丢失。
-    - v1.3: 每次 "NEW BEST" 时, rank 0 原子写入
-        <dirname(input_pickle)>/best_checkpoint.pt
-      下次重跑可以手动加载 (本版本不做自动恢复, 保持 CLI 不变)。
-      写入失败不影响训练主循环, 仅打印警告。
+  ── 根因 (4 个独立 bug) ─────────────────────────────────────────────────
 
-  [PERF] 标准化换成 torch 原生
-    - v1.2: sklearn.StandardScaler 单线程 + float64 中间态。
-    - v1.3: torch.mean/std (unbiased=False 匹配 sklearn 行为),
-      完全在 float32 上运算, 省一次大矩阵的 numpy↔torch 转换。
+    BUG 1: 早停被锁在 Phase 3
+      旧 train() 里:
+          if phase == 3:
+              should_stop = (... patience >= early_stop_patience)
+              if self._broadcast_stop_flag(should_stop):
+                  break
+      Phase 1/2 不管 patience 怎么涨都不停。EPOCHS=100000 时 Phase 1 占
+      33333 epoch, 即使 Phase 1 的 recon loss 在 epoch 1000 就已经收敛,
+      也要继续白跑 32000 epoch 才会进 Phase 2。
 
-v1.3 (2026-04-27) 关键 BUG-FIX 收尾 —— 与 model.py 配套:
+    BUG 2: patience 只在 silhouette 改善时清零
+      Phase 1 的 loss 权重: diversity=0.0, spread=0.0, augment=0.0
+      ——根本没有任何 loss 项推染色体分簇。silhouette 在 epoch 51 凭运气
+      达到 0.5674, 之后 reconstruction 把 latent 摊平, silhouette 单调
+      下降到 ~0.49 再也回不去。patience 从此一路涨到天荒地老。
+      用户的预期 ("loss 不动就停") 才是对的: Phase 1 该看 loss, 不该
+      看 silhouette。
 
-  [BUG-FIX] hyena 死代码导致 70+ 小时空转 (model.py 已修复主因)
-    - 现象: DDP 日志报告所有 hyena_blocks 参数 unused, 训练 70 小时
-      silhouette 不动。根因是 ManifoldConstrainedResidual.forward
-      的入参 x 没被使用 —— 详见 model.py 文件头注释。
-    - 此处的配套修改: 将 DDP 包装的 find_unused_parameters 从 True 改
-      为 False。修复后所有参数都真实参与梯度回流, 不再需要 DDP 每步
-      扫一遍参数表来找 "unused", backward 提速约 5–10%。
-    - DDP anchor (1e-30 量级的 z+z_aug+pred_v 求和) 保留: 它的作用是
-      在 augment weight=0 (Phase 1) 时把 z_aug 的子图也连进 total loss,
-      防止 phase 切换时 DDP 看到的图结构不一致。anchor 数值上等于 0,
-      不影响优化方向。
+    BUG 3: ReduceLROnPlateau 跨 phase 共享, LR 在 Phase 1 就死了
+      scheduler 配置: factor=0.5, patience=200, min_lr=1e-6.
+      Phase 1 的 recon loss 在 epoch 1000 收敛后, scheduler 每 200 epoch
+      没改善就把 LR 砍半, 大约 epoch 3000 触底 1e-6。
+      等 Phase 2 在 epoch 33334 启动、diversity/spread 突然加进来时,
+      LR 已经死透, 模型根本爬不出 Phase 1 找到的局部解。Phase 3 同理。
+      EPOCHS=18000 时这个问题被掩盖 (Phase 1 才 6000 epoch, LR 来不及
+      死透), 一拉长就暴露。
 
-  [LOG-NOISE FIX] 默认关掉 TORCH_DISTRIBUTED_DEBUG
-    - 之前的 528 MB 日志大头来自 shell 脚本里 export 的
-      TORCH_DISTRIBUTED_DEBUG=DETAIL + TORCH_CPP_LOG_LEVEL=INFO,
-      gloo 每次 collective 都打 ProcessGroupWrapper 指纹 + Reducer
-      detail, 严重拖慢 allreduce 并把磁盘 I/O 变成瓶颈。
-    - 配套的 shell 脚本已把这两行改为 OFF/ERROR, 此处仅在文档中记录。
+    BUG 4: Phase 2/3 开头从 Phase 1 末态出发
+      旧版本 phase 切换时: 模型继续从上一 phase 最后一步的状态开始。
+      但 Phase 1 末态可能是个 reconstruction-only 摊平的烂解, 比 Phase 1
+      早期 silhouette 0.5674 的状态差得多。从烂解出发, Phase 2 的
+      diversity/spread 即使 LR 充足也很难恢复。
+
+  ── 修复 ────────────────────────────────────────────────────────────────
+
+    FIX 1: 早停在所有 phase 都能触发, 但语义分两种
+      * Phase 1/2: patience 超阈值 → 推进到下一 phase (而不是终止)
+      * Phase 3: patience 超阈值 → 终止整个训练
+      用户原本的用法 ("loss 不动就退出") 在 Phase 3 完全保留;
+      Phase 1/2 升级为更聪明的 "loss 不动就快进", 不浪费 epoch。
+
+    FIX 2: patience 改成 loss-based + silhouette-based 双触发清零
+      * 每步 patience += 1
+      * 当前 loss 低于 phase 内历史最低 → patience = 0
+      * silhouette 高于全局历史最高 → patience = 0
+      用户 "loss 不怎么动就停" 的直觉直接落实成代码。
+
+    FIX 3: 每个 phase 开头重置 LR + 重建 scheduler
+      * lr 拉回 args.lr (Phase 2/3 也有完整 LR 预算)
+      * scheduler 重建: 全新的 plateau patience 计数从 0 开始
+      防止 Phase 1 把 LR 砍光后留给 Phase 2/3 一个死局。
+
+    FIX 4: Phase 2/3 开头 restore best_state
+      从已知最好的 silhouette 点出发, 而不是从 Phase 1 末态烂解出发。
+      DDP 模式下 rank 0 加载 + broadcast 到其他 rank。
+
+  ── 行为差异 (相对 v1.3) ────────────────────────────────────────────────
+    * CLI 完全兼容, 无新参数
+    * --early_stop_patience 默认 500, 含义: "phase 内连续 X epoch
+      loss/silhouette 都不改善就推进 phase / 终止"
+    * EPOCHS=100000 现在是合理的 "上限", 实际训练通常在每个 phase
+      跑 1000-3000 epoch 就推进, 总用时大幅缩短
+    * EPOCHS=18000 (v1.2 默认) 行为变化不大: Phase 1 该早完早完, Phase 3
+      早停准确触发
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -105,15 +147,10 @@ def _early_parse_parallelism():
         nw = int(os.environ.get('KGP_NUM_WORKERS', '1'))
     if nt is None:
         env_nt = os.environ.get('KGP_NUM_THREADS')
-        # 默认 16 线程/worker. 这是 argparse 意义上的 default,
-        # 不是硬编码上限 —— CLI --num_threads / env KGP_NUM_THREADS 随时覆盖。
-        # 选 16 的理由: AMD Zen3 / Intel Ice Lake 上实测 sweet spot, 能跑满
-        # 单 CCX 的 L3 cache 又不触发跨 NUMA penalty.
         nt = int(env_nt) if env_nt is not None else 16
 
     nw = max(1, nw)
 
-    # nt == 0 → auto (cpu_count / num_workers); nt < 0 → all cores
     total = _detect_cpu_count()
     if nt == 0:
         nt = max(1, total // nw)
@@ -133,14 +170,13 @@ if _NUM_WORKERS * _NUM_THREADS > _CPU_TOTAL:
         file=sys.stderr
     )
 
-# ── 设置环境变量 (在 import torch 之前!) ──
 _NT_STR = str(_NUM_THREADS)
 for _var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
              'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
     os.environ[_var] = _NT_STR
 os.environ.setdefault('MKL_DYNAMIC', 'FALSE')
 os.environ.setdefault('OMP_DYNAMIC', 'FALSE')
-os.environ.setdefault('MKL_DEBUG_CPU_TYPE', '5')   # AMD-friendly
+os.environ.setdefault('MKL_DEBUG_CPU_TYPE', '5')
 os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -176,12 +212,6 @@ sys.stdout.reconfigure(line_buffering=True)
 #  CPU 亲和性 & torch runtime 配置
 # ═══════════════════════════════════════════════════════════════════════════
 def _set_worker_cpu_affinity(rank: int, world_size: int, threads_per_worker: int):
-    """
-    将当前进程绑定到 CPU 列表的一个连续子集。
-
-    在 2-socket × 8-NUMA 的 AMD EPYC 上, 连续 CPU 编号往往对应同一个 NUMA,
-    所以这个绑定同时起到了 NUMA locality 的作用。
-    """
     if not hasattr(os, 'sched_setaffinity'):
         return None
     try:
@@ -194,7 +224,6 @@ def _set_worker_cpu_affinity(rank: int, world_size: int, threads_per_worker: int
     end = start + threads_per_worker
 
     if start >= total:
-        # 过订阅: rank 超出核数, 不做绑定
         return None
 
     end = min(end, total)
@@ -207,18 +236,10 @@ def _set_worker_cpu_affinity(rank: int, world_size: int, threads_per_worker: int
 
 
 def _configure_torch_runtime(num_threads: int):
-    """
-    在本进程内配置 torch 的线程和 JIT fusion。
-
-    v1.3: set_num_interop_threads 只能在任何 op dispatch 之前调用一次。
-    部分 import 顺序下 PyTorch 内部已经初始化, 直接调用会抛
-    RuntimeError。用 try/except 包裹, 已初始化时静默继续。
-    """
     torch.set_num_threads(num_threads)
     try:
         torch.set_num_interop_threads(max(2, num_threads // 4))
     except RuntimeError:
-        # interop thread pool 已经初始化; 保留当前值即可。
         pass
     torch.backends.mkldnn.enabled = True
     try:
@@ -275,21 +296,21 @@ def _unwrap(model):
 
 
 def _standardize_inplace(X_np: np.ndarray) -> torch.Tensor:
-    """
-    v1.3: torch 原生标准化, 替代 sklearn.StandardScaler.
-
-    匹配 sklearn 的行为:
-      - 按列 (feature-wise) 减均值除标准差
-      - std 使用 population std (ddof=0), 与 sklearn 默认一致
-      - std ~= 0 的列 clamp 到 1e-8, 避免除零 (sklearn 默认 with_std=True 也会这样)
-
-    省掉一次大矩阵的 float64 中间态, 并在 float32 上完成整个过程。
-    """
     X_tensor = torch.from_numpy(np.ascontiguousarray(X_np)).float()
     mean = X_tensor.mean(dim=0, keepdim=True)
     std  = X_tensor.std(dim=0, unbiased=False, keepdim=True).clamp_(min=1e-8)
     X_tensor.sub_(mean).div_(std)
     return X_tensor
+
+
+def _build_scheduler(optimizer):
+    """
+    v1.3.1: scheduler 抽出独立工厂函数, 因为现在每个 phase 开头都要重建一次。
+    factor=0.5 / patience=200 / min_lr=1e-6 与 v1.2/v1.3 完全一致, 接口不变。
+    """
+    return optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=200, min_lr=1e-6
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -304,10 +325,13 @@ class AdaptiveTrainer:
     其他 rank 只做 forward/backward; 梯度 all_reduce 由 DDP 在 backward 里
     自动完成。
 
-    v1.3 变化 (外部接口不变):
-      - self.patience 按 epoch 累加, 由 evaluate 在改善时清零
-        (v1.2 是按 evaluate 次数累加, 导致早停永远不触发)
-      - _save_checkpoint 将每次 best_state 同步落盘
+    v1.3.1 状态机:
+      - self.patience  : 上次 "改善" 距今的 epoch 数 (rank 0 维护)
+        改善定义 = (loss 创 phase 内新低) OR (silhouette 创全局新高)
+      - self.best_loss_in_phase : 当前 phase 的最低 total loss (用于 patience 判定)
+        每个 phase 开头重置为 inf
+      - self.best_score / self.best_state : 全局最佳 silhouette 及对应权重
+        跨 phase 保留, Phase 2/3 开头会 restore best_state
     """
     def __init__(self, model, optimizer, scheduler, args,
                  rank: int = 0, world_size: int = 1):
@@ -320,15 +344,17 @@ class AdaptiveTrainer:
         self.world_size = world_size
         self.is_main = (rank == 0)
 
+        # 全局最佳: 跨 phase 保留, 训练结束后返回
         self.best_score = -1.0
         self.best_state = None
         self.best_n_clusters = 2
         self.best_chrom_map = {}
+
+        # phase 内 loss 跟踪 (v1.3.1 新增)
+        self.best_loss_in_phase = float('inf')
         self.patience = 0
 
-        # v1.3: checkpoint 路径跟 input_pickle 同目录 (PROCESS_DIR)
-        # shell 脚本里 PROCESS_DIR = <work_dir>/process/<species_name>/,
-        # FEATURES_PKL 就在这个目录下, 所以 dirname 取对。
+        # checkpoint 路径
         self._checkpoint_path = os.path.join(
             os.path.dirname(os.path.abspath(args.input_pickle)),
             'best_checkpoint.pt'
@@ -346,7 +372,7 @@ class AdaptiveTrainer:
                             'smoothness': 0.8, 'augment': 0.5, 'spread': 0.3}
             },
             3: {
-                'epochs': args.epochs // 3,
+                'epochs': args.epochs - 2 * (args.epochs // 3),
                 'weights': {'recon': 0.5, 'fm': 0.2, 'diversity': 0.8,
                             'smoothness': 1.0, 'augment': 0.8, 'spread': 0.5}
             }
@@ -358,10 +384,6 @@ class AdaptiveTrainer:
 
     def _save_checkpoint(self, global_epoch: int, phase: int, score: float,
                          n_clusters: int, chrom_map: dict):
-        """
-        v1.3: 原子写入 best checkpoint。
-        失败不影响训练; 仅打印 warning, 内存中的 best_state 仍可用。
-        """
         if not self.is_main or self.best_state is None:
             return
         tmp_path = self._checkpoint_path + '.tmp'
@@ -373,44 +395,37 @@ class AdaptiveTrainer:
                 'chrom_map'    : dict(chrom_map),
                 'epoch'        : int(global_epoch),
                 'phase'        : int(phase),
-                'version'      : '1.3',
+                'version'      : '1.3.1',
             }, tmp_path)
             os.replace(tmp_path, self._checkpoint_path)
         except Exception as e:
             self._log(f"  [WARN] checkpoint save failed: {e}")
-            # 清理可能留下的 .tmp
             try:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
             except OSError:
                 pass
 
+    def _broadcast_model_state(self):
+        """
+        v1.3.1: phase 切换时, rank 0 把 best_state load 进 self.model 后,
+        需要把权重广播给其他 rank, 否则 DDP 各 rank 的模型就分歧了。
+
+        DDP 在 backward 时只 all_reduce 梯度, 不 sync 权重。所以手动 load
+        state_dict 后必须显式 broadcast。
+        """
+        if self.world_size <= 1:
+            return
+        for p in self.model.parameters():
+            dist.broadcast(p.data, src=0)
+        for b in self.model.buffers():
+            dist.broadcast(b.data, src=0)
+
     def compute_loss(self, x, window_ids, phase=1):
         """
-        统一前向 + 6 loss 计算 (DDP-safe 版)。
-
-        关键点:
-          1. 只对 self.model 调用一次 (确保 DDP 的 reducer 只处理一次 forward)。
-          2. 所有 loss 张量必须"连在计算图上"——即使数学上为 0, 也要让
-             autograd 能 traverse 到它。退化情况下 (如 batch 里只有单染色体)
-             用 z.sum() * 0.0 而非 torch.tensor(0.0)。
-          3. 权重为 0 的 loss **跳过** (不乘 0), 因为 `0 * tensor` 会被
-             autograd 剪枝, 导致该 loss 贡献的子图 (如 z_aug 路径) 在
-             不同 rank 间可能被剪掉/保留不一致, 触发
-             "Expected to have finished reduction in prior iteration" 错误。
-          4. 末尾加一个 tiny anchor = 1e-30 * sum(recon+z+z_aug+pred_v),
-             确保所有输出张量每步都连到 total loss, 即使其他所有 loss
-             的权重都是 0 也能保持 DDP 的参数 ready-flag 一致性。
-
-        v1.3: 对于 cheap 的 pure-z-domain 损失 (diversity / smoothness /
-        spread), 当权重为 0 时直接填 _zero_like(z) 占位, 跳过实际计算。
-        augment loss 是 z vs z_aug 的 MSE, 与 z_aug 的 encoder forward
-        本来就是要跑的 (anchor 依赖), 因此不跳, 直接算 (基本不花时间)。
-
-        v1.3 (2026-04-27) 备注: 在 mHC.forward 修复 + find_unused=False 之后,
-        anchor 不再是 "防 DDP 出错" 必需, 但仍保留——它的边际成本 ~0,
-        而且让计算图在 phase 切换 (augment weight 从 0 变成 0.5 等) 时
-        始终保持同样的输出依赖结构, 给将来扩展留余量。
+        统一前向 + 6 loss 计算 (DDP-safe 版)。详见 v1.3 注释。
+        v1.3.1 没有改这个函数, 只是它的返回值 total 现在会被外面用来
+        驱动 patience 状态机。
         """
         weights = self.phase_configs[phase]['weights']
 
@@ -418,22 +433,17 @@ class AdaptiveTrainer:
         t   = torch.rand(x.size(0), 1, device=x.device)
         z_0 = torch.randn(x.size(0), self.args.latent_dim, device=x.device)
 
-        # ── 单次 DDP-routed forward ──
         out = self.model(x, x_aug=x_aug, t=t, z_0=z_0)
         recon  = out['recon']
         z      = out['z']
         z_aug  = out['z_aug']
         pred_v = out['pred_v']
 
-        # ── 必算项: recon, fm, augment ──
         l_recon   = F.mse_loss(recon, x)
         target_v  = z - z_0
         l_fm      = F.mse_loss(pred_v, target_v)
-        l_augment = F.mse_loss(z, z_aug)   # z_aug 本来就算了, 这里再跑一个 MSE 几乎免费
+        l_augment = F.mse_loss(z, z_aug)
 
-        # ── 惰性项: 仅在权重 > 0 时真算, 否则占位 ──
-        # v1.3 优化: Phase 1 里 diversity/spread 权重都是 0, 跳过
-        # window_ids 解析 + centroid 聚合 + pairwise distance 的开销。
         _zero = self.losses._zero_like(z)
 
         l_diversity  = (self.losses.diversity_loss(z, window_ids)
@@ -443,7 +453,6 @@ class AdaptiveTrainer:
         l_spread     = (self.losses.spread_loss(z, window_ids)
                         if weights['spread']     > 0 else _zero)
 
-        # ── 聚合: 权重为 0 的项跳过, 不乘 0 (避免 autograd 剪枝) ──
         items = [
             ('recon',      weights['recon'],      l_recon),
             ('fm',         weights['fm'],         l_fm),
@@ -460,13 +469,8 @@ class AdaptiveTrainer:
             total = term if total is None else (total + term)
 
         if total is None:
-            # 所有权重都是 0 (不应发生, 但防御性处理)
-            total = 0.0 * l_recon  # 连图的 0
+            total = 0.0 * l_recon
 
-        # ── DDP anchor: 让所有 forward 输出每步都连到 total ──
-        # 1e-30 量级远低于任何真实 loss 的噪声, 数值上等于什么都没加,
-        # 但 autograd 会为此保留从每个输出到参数的完整 backward 路径,
-        # 从而保证 DDP 在每个 rank 上看到完全一致的 ready-flag 序列。
         anchor = 1e-30 * (recon.sum() + z.sum() + z_aug.sum() + pred_v.sum())
         total = total + anchor
 
@@ -519,21 +523,69 @@ class AdaptiveTrainer:
         dist.broadcast(flag, src=0)
         return bool(flag.item())
 
+    def _reset_phase_state(self, phase: int):
+        """
+        v1.3.1: phase 边界状态重置。在每个 phase 进入 epoch 循环前调用。
+
+        操作:
+          1. (phase >= 2) restore best_state: 从已知最好 silhouette 点出发
+          2. (phase >= 2) LR 拉回 args.lr
+          3. (phase >= 2) 重建 ReduceLROnPlateau scheduler
+          4. patience / best_loss_in_phase 清零
+
+        DDP 安全性: rank 0 load_state_dict 后必须 broadcast 给其他 rank,
+        否则 DDP backward 时各 rank 模型分歧 → 梯度 all_reduce 后行为不
+        确定 (虽然不会立刻报错)。
+        """
+        if phase >= 2:
+            if self.is_main and self.best_state is not None:
+                _unwrap(self.model).load_state_dict(self.best_state)
+                self._log(f"  ↻ Restored best model from history "
+                          f"(Sil={self.best_score:.4f})")
+            elif self.is_main:
+                self._log(f"  ↻ No best_state yet (Phase 1 found nothing); "
+                          f"continuing from current weights")
+
+            # DDP: 把 rank 0 的权重同步给其他 rank
+            self._broadcast_model_state()
+
+            # v1.3.1: best_state 恢复后 AdamW 动量是 Phase 末态的脏数据,
+            # 指向旧权重的梯度方向。清零 exp_avg/exp_avg_sq 让新 phase 从干净动量出发。
+            if self.is_main and self.best_state is not None:
+                for state in self.optimizer.state.values():
+                    for k in list(state.keys()):
+                        if isinstance(state[k], torch.Tensor):
+                            state[k].zero_()
+
+            # LR 重置 (所有 rank 都做, 因为 optimizer state 是 per-rank 的)
+            new_lr = self.args.lr
+            for g in self.optimizer.param_groups:
+                g['lr'] = new_lr
+            # scheduler 重建: 全新 plateau patience
+            self.scheduler = _build_scheduler(self.optimizer)
+            self._log(f"  ↻ LR reset to {new_lr:.6f}, scheduler rebuilt")
+
+        if self.is_main:
+            self.patience = 0
+            self.best_loss_in_phase = float('inf')
+
     def train(self, X_tensor, window_ids):
         self._log("\n" + "=" * 80)
-        self._log("ADAPTIVE UNSUPERVISED TRAINING  (v1.3)")
+        self._log("ADAPTIVE UNSUPERVISED TRAINING  (v1.3.1)")
         self._log(f"World size    : {self.world_size} worker(s)")
         self._log(f"Threads/wkr   : {torch.get_num_threads()} (intra) / "
                   f"{torch.get_num_interop_threads()} (inter)")
         self._log(f"Effective batch: {self.world_size} × {self.args.batch_size} "
                   f"= {self.world_size * self.args.batch_size}")
         self._log(f"Checkpoint    : {self._checkpoint_path}")
-        self._log(f"Patience (ep) : {self.args.early_stop_patience}  "
-                  f"(v1.3: 按 epoch 计数, 改善即清零)")
+        self._log(f"Patience      : {self.args.early_stop_patience} epochs "
+                  f"(per-phase, loss-based + silhouette-based)")
+        self._log(f"Early stop    : Phase 1/2 → advance phase, Phase 3 → terminate")
         self._log("=" * 80, flush=True)
 
         total_epochs = self.args.epochs
         elapsed = 0
+        terminate_training = False
 
         for phase in [1, 2, 3]:
             config = self.phase_configs[phase]
@@ -545,19 +597,18 @@ class AdaptiveTrainer:
             self._log(f"Loss weights: {config['weights']}")
             self._log(f"{'=' * 80}", flush=True)
 
+            # ── v1.3.1: phase 进入前重置 LR / scheduler / patience ──
+            self._reset_phase_state(phase)
+
             cached_sil = 0.0
             cached_k = 2
-
-            # Phase 切换时, 重置 patience: 新阶段的 loss 形貌可能和旧阶段完全
-            # 不一样, 继承旧的 patience 会导致 Phase 3 开始时立刻触发早停。
-            if self.is_main:
-                self.patience = 0
+            epochs_run_in_phase = 0
 
             for epoch in range(phase_epochs):
                 global_epoch = elapsed + epoch + 1
+                epochs_run_in_phase = epoch + 1
                 self.model.train()
 
-                # ── 每个 rank 用不同 seed 采样不同 micro-batch ──
                 g = torch.Generator()
                 g.manual_seed(global_epoch * 10007 + self.rank * 31 + phase)
                 idx = torch.randperm(X_tensor.size(0), generator=g)[:self.args.batch_size]
@@ -567,14 +618,19 @@ class AdaptiveTrainer:
                 loss, loss_dict = self.compute_loss(batch_x, batch_ids, phase)
 
                 self.optimizer.zero_grad()
-                loss.backward()     # DDP 在此 all-reduce 梯度
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.scheduler.step(loss.item())
 
-                # ── v1.3: patience 每个 epoch 累加 (rank 0 独家维护) ──
+                # ── v1.3.1: patience 状态机 (rank 0 维护) ──
+                # 每 epoch 默认 +1; loss 创 phase 内新低 → 清零
                 if self.is_main:
                     self.patience += 1
+                    cur_loss = loss.item()
+                    if cur_loss < self.best_loss_in_phase:
+                        self.best_loss_in_phase = cur_loss
+                        self.patience = 0   # loss 改善: 重置
 
                 # ── evaluate 只在 rank 0, 每 50 epoch 一次 ──
                 best_marker = ""
@@ -585,17 +641,15 @@ class AdaptiveTrainer:
 
                     if score > self.best_score:
                         self.best_score = score
-                        # 保存裸模型 state_dict (去掉 DDP "module." 前缀)
                         self.best_state = {
                             k: v.detach().clone()
                             for k, v in _unwrap(self.model).state_dict().items()
                         }
                         self.best_n_clusters = n_clusters
                         self.best_chrom_map = chrom_map
-                        self.patience = 0      # v1.3: 改善即清零
+                        self.patience = 0     # silhouette 改善: 也重置
                         best_marker = " ★ NEW BEST"
 
-                        # v1.3: 同步落盘, 崩溃保护
                         self._save_checkpoint(
                             global_epoch=global_epoch,
                             phase=phase,
@@ -605,7 +659,7 @@ class AdaptiveTrainer:
                         )
 
                     if epoch % 200 == 0 and epoch > 0:
-                        self._log("  Chromosome → Subgenome:")
+                        self._log("  Chromosome → Subgenome (snapshot, not final):")
                         for chrom, cluster in sorted(chrom_map.items()):
                             self._log(f"    {chrom} → Subgenome {cluster}")
 
@@ -626,18 +680,35 @@ class AdaptiveTrainer:
                         flush=True
                     )
 
-                # ── 早停: rank 0 决定, 广播给所有 rank ──
-                if phase == 3:
-                    should_stop = (self.is_main and
-                                   self.patience >= self.args.early_stop_patience)
-                    if self._broadcast_stop_flag(should_stop):
-                        self._log(f"\n[Early stopping] no improvement for "
-                                  f"{self.args.early_stop_patience} epochs "
-                                  f"(reached at global epoch {global_epoch})",
+                # ── v1.3.1: 早停在所有 phase 都能触发 ──
+                # Phase 1/2 → 推进到下一 phase
+                # Phase 3   → 终止整个训练
+                should_stop = (self.is_main and
+                               self.patience >= self.args.early_stop_patience)
+                stop_flag = self._broadcast_stop_flag(should_stop)
+
+                if stop_flag:
+                    if phase < 3:
+                        self._log(f"\n[Phase {phase} stalled] no loss/silhouette "
+                                  f"improvement for {self.args.early_stop_patience} "
+                                  f"epochs at global epoch {global_epoch}. "
+                                  f"Advancing to Phase {phase + 1} early "
+                                  f"(skipping {phase_epochs - epochs_run_in_phase} "
+                                  f"remaining epochs of Phase {phase}).",
                                   flush=True)
                         break
+                    else:
+                        self._log(f"\n[Early stopping] no loss/silhouette "
+                                  f"improvement for {self.args.early_stop_patience} "
+                                  f"epochs in Phase 3 at global epoch {global_epoch}.",
+                                  flush=True)
+                        terminate_training = True
+                        break
 
-            elapsed += phase_epochs
+            elapsed += epochs_run_in_phase
+
+            if terminate_training:
+                break
 
         return self.best_state, self.best_score, self.best_n_clusters
 
@@ -650,7 +721,6 @@ def _run_training(rank: int, world_size: int, args):
 
     _configure_torch_runtime(args.num_threads)
 
-    # ── 加载数据 ──
     if is_main:
         print("\n" + "=" * 80)
         print("LOADING DATA")
@@ -662,10 +732,8 @@ def _run_training(rank: int, world_size: int, args):
     window_ids = sorted([k for k in data.keys() if isinstance(data[k], np.ndarray)])
     X = np.vstack([data[wid] for wid in window_ids])
 
-    # v1.3: torch 原生标准化, 替代 sklearn.StandardScaler
-    # 结果与 sklearn 数值上在 float32 精度内一致 (unbiased=False matches ddof=0).
     X_tensor = _standardize_inplace(X)
-    del X   # free the numpy buffer
+    del X
 
     chrom_ids = [wid.rpartition('_')[0] for wid in window_ids]
     unique_chroms = sorted(set(chrom_ids))
@@ -677,7 +745,6 @@ def _run_training(rank: int, world_size: int, args):
         print(f"Workers     : {world_size}")
         print(f"Threads/wkr : {args.num_threads}", flush=True)
 
-    # ── 模型构建 (所有 rank 同一随机种子, DDP 会再做一次广播) ──
     torch.manual_seed(args.seed)
     model = AdaptiveUnsupervisedEncoder(
         input_dim=args.input_dim,
@@ -689,29 +756,7 @@ def _run_training(rank: int, world_size: int, args):
     )
 
     if world_size > 1:
-        # ── DDP 包装 ─────────────────────────────────────────────────────
-        # v1.3 (2026-04-27) FIX: find_unused_parameters: True → False
-        #
-        # 旧注释:
-        #   v1.2 时打开 find_unused_parameters=True, 用来容忍
-        #   "compute_loss 在权重为 0 时跳过 loss 项" 导致部分子图不
-        #   参与 backward 的情况。
-        #
-        # 新原因:
-        #   实际上之前真正 unused 的不是被跳过的 loss 项, 而是 hyena_blocks
-        #   的所有 80 个参数 —— ManifoldConstrainedResidual.forward 没用
-        #   入参 x, hyena 的输出在 _encode 里被当场丢弃。已在 model.py
-        #   修复 (mHC.forward 把 x 加到所有 stream 上)。
-        #
-        # 现在所有参数每步都收到梯度, find_unused_parameters=False:
-        #   * 省掉每步 ~5–10% 的 backward 开销 (DDP 不再扫参数表);
-        #   * compute_loss 里的 1e-30 anchor 仍保留, 用来确保 z_aug 路径
-        #     在 augment weight=0 (Phase 1) 时也连进 total loss 的图,
-        #     避免 phase 切换时图结构出现 rank 间差异。anchor 数值为 0,
-        #     不影响优化方向。
-        #
-        # 如果将来你再扩 forward 让某些参数确实变 conditionally-unused
-        # (e.g. 不同 phase 用不同 head), 把这里改回 True 即可。
+        # find_unused_parameters=False (v1.3 hyena fix 之后所有参数都参与回流)
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             find_unused_parameters=False,
@@ -723,9 +768,7 @@ def _run_training(rank: int, world_size: int, args):
         print(f"Use mHC      : {args.use_mhc}", flush=True)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=200, min_lr=1e-6
-    )
+    scheduler = _build_scheduler(optimizer)
 
     trainer = AdaptiveTrainer(model, optimizer, scheduler, args,
                               rank=rank, world_size=world_size)
@@ -734,7 +777,6 @@ def _run_training(rank: int, world_size: int, args):
     if world_size > 1:
         dist.barrier()
 
-    # ── 最终 eval + 保存: 只在 rank 0 ──
     if not is_main:
         return
 
@@ -786,8 +828,6 @@ def _run_training(rank: int, world_size: int, args):
 #  多进程 worker 入口
 # ═══════════════════════════════════════════════════════════════════════════
 def _worker_entry(rank: int, args):
-    """每个 mp.spawn 出来的子进程从这里开始。"""
-    # 子进程中重新设置环境 (spawn 不继承父进程的 env 修改)
     nt = args.num_threads
     for v in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
               'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
@@ -795,15 +835,10 @@ def _worker_entry(rank: int, args):
     os.environ.setdefault('MKL_DYNAMIC', 'FALSE')
     os.environ.setdefault('OMP_DYNAMIC', 'FALSE')
 
-    # CPU 亲和性绑定
     my_cpus = _set_worker_cpu_affinity(rank, args.num_workers, nt)
 
-    # ── DDP 初始化: file-based rendezvous (gloo backend) ──────────────────
-    # 使用文件 rendezvous 而非 TCP port, 避免多个 qsub 任务同时跑时的端口冲突。
-    # 父进程已经在 main() 里设好了 KGP_RENDEZVOUS, 所有子进程通过 env 继承。
     rendezvous = os.environ.get('KGP_RENDEZVOUS')
     if not rendezvous:
-        # fallback (不应走到这里, 但以防万一)
         import tempfile
         rendezvous = os.path.join(
             tempfile.gettempdir(),
@@ -841,12 +876,10 @@ def _build_parser():
         description=__doc__,
     )
 
-    # ── IO ──
     p.add_argument('--input_pickle', required=True)
     p.add_argument('--output_tsv', required=True, dest='output_tsv')
     p.add_argument('--output_subgenome_json', default=None)
 
-    # ── 模型 ──
     p.add_argument('--input_dim',  type=int, default=1024)
     p.add_argument('--hidden_dim', type=int, default=256)
     p.add_argument('--latent_dim', type=int, default=20)
@@ -854,30 +887,27 @@ def _build_parser():
     p.add_argument('--n_layers',   type=int, default=3)
     p.add_argument('--use_mhc',    action='store_true', default=True)
 
-    # ── 训练 ──
     p.add_argument('--epochs',              type=int,   default=18000)
     p.add_argument('--lr',                  type=float, default=0.0003)
     p.add_argument('--batch_size',          type=int,   default=512,
                    help="Per-worker micro-batch size. "
                         "Effective batch = num_workers × batch_size")
     p.add_argument('--early_stop_patience', type=int,   default=500,
-                   help="v1.3: counted in epochs (not eval steps). "
-                        "Stops when no silhouette improvement for this "
-                        "many consecutive epochs.")
+                   help="v1.3.1: per-phase patience in epochs. "
+                        "Counts epochs since last loss minimum (within phase) "
+                        "or silhouette maximum (global). On exceed: "
+                        "Phase 1/2 advances to next phase, Phase 3 terminates.")
     p.add_argument('--seed',                type=int,   default=42)
 
-    # ── CPU 并行 (关键新参数, 零硬编码) ──
     p.add_argument('--num_workers', type=int,
                    default=_NUM_WORKERS,
                    help="Number of data-parallel worker processes. "
-                        "1 = single-process (v1.2 compatible). "
+                        "1 = single-process. "
                         "Default from env KGP_NUM_WORKERS, else 1.")
     p.add_argument('--num_threads', type=int,
                    default=_NUM_THREADS,
                    help="MKL/OMP threads per worker. "
-                        "0 = auto (cpu_count / num_workers), "
-                        "-1 = use all available CPUs. "
-                        "Default from env KGP_NUM_THREADS, else auto.")
+                        "0 = auto, -1 = use all available CPUs.")
 
     return p
 
@@ -886,7 +916,6 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
-    # 兜底: 确保最终值合法
     args.num_workers = max(1, args.num_workers)
     if args.num_threads <= 0:
         args.num_threads = max(1, _CPU_TOTAL // args.num_workers)
@@ -900,10 +929,6 @@ def main():
     print("=" * 80, flush=True)
 
     if args.num_workers > 1:
-        # ── Rendezvous 文件管理: 每个 python 进程都是独立的 rendezvous ──
-        # 优先级: KGP_RENDEZVOUS env > auto-pick (pid + 纳秒时间戳)。
-        # shell 脚本建议设 KGP_RENDEZVOUS=<process_dir>/.kgp_rdzv_${PBS_JOBID:-$$}
-        # 以便和 qsub 调度器联动; 不设也绝对不会冲突。
         import time
         rdz_path = os.environ.get('KGP_RENDEZVOUS')
         if not rdz_path:
@@ -916,7 +941,6 @@ def main():
         rdz_path = os.path.abspath(rdz_path)
         os.environ['KGP_RENDEZVOUS'] = rdz_path
 
-        # 清理可能的 stale 文件 (之前任务崩溃遗留的)
         if os.path.exists(rdz_path):
             try:
                 os.unlink(rdz_path)
@@ -933,16 +957,15 @@ def main():
                 join=True,
             )
         finally:
-            # 训练结束后清理 rendezvous 文件
             if os.path.exists(rdz_path):
                 try:
                     os.unlink(rdz_path)
                 except OSError:
                     pass
     else:
-        # 单进程 —— 与 v1.2 行为完全一致, 不需要 rendezvous
         _run_training(rank=0, world_size=1, args=args)
 
 
 if __name__ == '__main__':
     main()
+
