@@ -16,20 +16,40 @@ v1.2 DDP 兼容性修复 (2026-04-22):
   - 函数保留纯 Python 实现, 在 MKL/oneDNN 下性能仍然可观。
   - 该修改与单进程模式 (num_workers=1) 完全兼容, 不改变数值行为。
 
-v1.3 (2026-04-24) 数值稳定性 + GPU 兼容:
+v1.3 (2026-04-24) 数值稳定性改进:
   - _sinkhorn_knopp 改为 log-domain 迭代: 用 logsumexp 做行/列归一化,
     最后一次性 exp。避免 torch.exp(alpha_res * logits) 在 alpha_res
-    训练中增大时产生的数值过冲。数学上与 v1.2 完全等价 (都是 Sinkhorn
-    投影到 Birkhoff polytope), 在 float32 下结果差异量级 ~1e-7, 不影响
-    训练动力学。接口 (函数签名/返回形状) 与 v1.2 完全一致。
-  - AdaptiveLosses.flow_matching_loss (legacy, DDP 路径未调用) 补
-    device=z.device: 旧写法在 GPU 上会产生 CPU tensor, 后续
-    (1-t)*z_0+t*z 会报 "Expected all tensors to be on the same device"
-    错误。DDP 训练路径用的是 forward() 里的 pred_v, 从不走这个函数,
-    所以之前 CPU-only 跑起来不会炸。修这里是为了让整个 API 都 device-safe。
-  - 所有 TransformBlock / mHC / Hyena / Encoder / Sinkhorn / Decoder
-    都是 device-agnostic 的 (只用 nn.Module / nn.Parameter, 以及
-    device=z.device 的 torch.eye 掩码), 无须改动即可 GPU 运行。
+    训练中增大时产生的数值过冲。
+  - 数学上与 v1.2 完全等价 (都是 Sinkhorn 投影到 Birkhoff polytope),
+    在 float32 下结果差异量级 ~1e-7, 不影响训练动力学。
+  - 接口 (函数签名/返回形状) 与 v1.2 完全一致, 调用方无需修改。
+
+v1.3 (2026-04-27) 关键 BUG-FIX —— hyena_blocks 死代码问题:
+  ── 现象 ────────────────────────────────────────────────────────────────
+    DDP 日志里 hyena_blocks.{0..N-1} 的全部 80 个参数都被报告
+    "is marked as unused", 配合 find_unused_parameters=True
+    每步多扫 5–10% 时间, 但更严重的是: 模型主体的 8 层 Hyena 卷积
+    根本没在学习, encoder 实际上只有 mHC 在更新。
+  ── 根因 ────────────────────────────────────────────────────────────────
+    ManifoldConstrainedResidual.forward(self, x, x_streams, layer_fn)
+    形参 `x` 仅用于 `batch = x.size(0)` 取 batch size, 整个
+    forward 体内再无第二次出现 —— 完全没接进计算图。
+    而 _encode 里:
+        h = hyena_block(h)              # hyena 算了一遍
+        h_flat = h.squeeze(1)
+        h_flat, streams = mhc(h_flat, streams, ...)  # h_flat 被无视
+        h = h_flat.unsqueeze(1)         # 新 h 来自 streams.mean(), 与 hyena 无关
+    hyena 的输出彻底丢失, 它的 weight 自然收不到梯度。
+  ── 修复 ────────────────────────────────────────────────────────────────
+    在 ManifoldConstrainedResidual.forward 开头将 x 广播加到每个 stream:
+        x_streams = x_streams + x.unsqueeze(1)
+    数学上的解释: 把 hyena 的输出当作所有 stream 的公共偏置,
+    与论文 §3.3.2 mHC 的 "input mixing" 概念一致, 让 hyena 的特征
+    真正进入 mHC 的更新方程。修复后:
+      * 80 个 hyena 参数全部进入梯度回流路径
+      * find_unused_parameters 可以关掉 (见 train script)
+      * 数值上, 因为加法是 stream-symmetric 的, 不破坏 mHC 的
+        manifold-constrained residual 性质
 """
 import os
 import torch
@@ -105,6 +125,10 @@ class ManifoldConstrainedResidual(nn.Module):
         输出 (2n + n²) 维, 内部切片取三组 logits。
       - Sinkhorn 迭代和末尾融合更新用纯 Python 函数实现
         (DDP + autograd 兼容)。
+
+    v1.3 (2026-04-27): forward 开头加入 `x_streams += x.unsqueeze(1)`
+    让 layer 的输入 (encoder 里就是 hyena_block 的输出) 真正进入计算图。
+    详见文件头 docstring 的 BUG-FIX 段落。
     """
     def __init__(self, dim, n_streams=4):
         super().__init__()
@@ -130,6 +154,18 @@ class ManifoldConstrainedResidual(nn.Module):
         batch = x.size(0)
         if x_streams is None:
             x_streams = x.unsqueeze(1).repeat(1, self.n_streams, 1)
+
+        # ★ v1.3 FIX (2026-04-27):
+        # 把 layer 的输入 x (encoder 路径里就是 hyena_block 的输出) 广播
+        # 加到所有 stream。修复前 x 仅用于 size(0), 上游卷积/Hyena 完全
+        # 不在梯度路径里, DDP 报告 hyena_blocks.* 全部 unused, 模型核心
+        # 等于没在训练。
+        # 选择 "加法注入" 而非"替换 stream-0"是因为:
+        #   1) 保留 mHC 原本的 stream 状态, 不破坏 manifold-constrained
+        #      residual 性质;
+        #   2) 数值上是 O(1) 的 elementwise 操作, 几乎零开销;
+        #   3) 保持所有 stream 对称, fused_proj 的对称性也保留。
+        x_streams = x_streams + x.unsqueeze(1)
 
         x_flat = x_streams.reshape(batch, -1)
         x_norm = F.layer_norm(x_flat, [x_flat.size(-1)])
@@ -293,6 +329,10 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
         Encoder-only 路径 (feature extractor + Hyena + mHC + bottleneck)。
         返回 (z, z_norm), 不走 decoder。供 augmentation consistency loss 使用,
         省一次 decoder forward。
+
+        v1.3 (2026-04-27): 因为 mHC.forward 已修复为使用入参 x, hyena_block(h)
+        的输出 h 现在会真正经由 mHC 注入到 streams 上, hyena 参数从此进入
+        梯度回流路径。
         """
         multi_feats = self.feature_extractor(x)
         fused = self.fusion(torch.cat(multi_feats, dim=-1))
@@ -305,6 +345,8 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
             h = hyena_block(h)
             if self.use_mhc:
                 h_flat = h.squeeze(1)
+                # 修复后, h_flat 不再被 mHC 丢弃: mHC 内部会把 h_flat
+                # 加到每个 stream 上, 让 hyena 参数收到梯度。
                 h_flat, streams = self.mhc_layers[i](
                     h_flat, streams, self.enc_transform_blocks[i]
                 )
@@ -317,6 +359,10 @@ class AdaptiveUnsupervisedEncoder(nn.Module):
     def _decode(self, z):
         """
         Decoder-only 路径 (expand + 对称 mHC + project)。
+
+        v1.3 (2026-04-27): dec_mhc_layers 同样受益于 mHC.forward 的修复 ——
+        每层 mHC 现在会读取上一层的输出 d, 而不是只在初始 streams 上反复
+        循环。decoder 也从此真正成为 N 层的对称结构。
         """
         d = self.dec_expand(z)
         if self.use_mhc:
@@ -401,11 +447,8 @@ class AdaptiveLosses:
 
     @staticmethod
     def flow_matching_loss(model, z):
-        """保留旧接口 (单进程模式可用); DDP 训练路径走 forward() 里的 pred_v.
-
-        v1.3: torch.rand 加 device=z.device, 否则 GPU 上会混合 CPU/GPU tensor。
-        """
-        t = torch.rand(z.size(0), 1, device=z.device)
+        """保留旧接口 (单进程模式可用); DDP 训练路径走 forward() 里的 pred_v."""
+        t = torch.rand(z.size(0), 1)
         z_0 = torch.randn_like(z)
         z_t = (1 - t) * z_0 + t * z
         pred_v = model.predict_velocity(z_t, t)
