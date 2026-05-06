@@ -22,90 +22,10 @@ v1.3 (2026-04-27) 关键 BUG-FIX —— 与 model.py 配套:
   - find_unused_parameters: True → False
   - 默认关掉 TORCH_DISTRIBUTED_DEBUG (528 MB 日志噪声)
 
-═══════════════════════════════════════════════════════════════════════════
-v1.3.1 (2026-04-28) 训练动力学修复 —— 4 个真 BUG:
-═══════════════════════════════════════════════════════════════════════════
-
-  ── 现象 ────────────────────────────────────────────────────────────────
-    EPOCHS=100000, LR=0.0001, early_stop_patience=1000 配置下:
-      * 训练跑到 8000 epoch 还在 Phase 1 (因为 Phase 1 = 33333 epoch)
-      * Pat=7949/1000 但训练不停
-      * LR 已经掉到 1e-6 地板 (从 epoch ~3000 开始)
-      * K=2 + 几乎所有染色体都进 Subgenome 0
-      * best Sil 是 epoch 51 的 0.5674, 之后再没改善过
-    用户反馈: "之前也是很高的初始 epoch, 但是早停会在 loss 不怎么动的
-    时候就退出啊", 即旧版本至少早停是有用的。
-
-  ── 根因 (4 个独立 bug) ─────────────────────────────────────────────────
-
-    BUG 1: 早停被锁在 Phase 3
-      旧 train() 里:
-          if phase == 3:
-              should_stop = (... patience >= early_stop_patience)
-              if self._broadcast_stop_flag(should_stop):
-                  break
-      Phase 1/2 不管 patience 怎么涨都不停。EPOCHS=100000 时 Phase 1 占
-      33333 epoch, 即使 Phase 1 的 recon loss 在 epoch 1000 就已经收敛,
-      也要继续白跑 32000 epoch 才会进 Phase 2。
-
-    BUG 2: patience 只在 silhouette 改善时清零
-      Phase 1 的 loss 权重: diversity=0.0, spread=0.0, augment=0.0
-      ——根本没有任何 loss 项推染色体分簇。silhouette 在 epoch 51 凭运气
-      达到 0.5674, 之后 reconstruction 把 latent 摊平, silhouette 单调
-      下降到 ~0.49 再也回不去。patience 从此一路涨到天荒地老。
-      用户的预期 ("loss 不动就停") 才是对的: Phase 1 该看 loss, 不该
-      看 silhouette。
-
-    BUG 3: ReduceLROnPlateau 跨 phase 共享, LR 在 Phase 1 就死了
-      scheduler 配置: factor=0.5, patience=200, min_lr=1e-6.
-      Phase 1 的 recon loss 在 epoch 1000 收敛后, scheduler 每 200 epoch
-      没改善就把 LR 砍半, 大约 epoch 3000 触底 1e-6。
-      等 Phase 2 在 epoch 33334 启动、diversity/spread 突然加进来时,
-      LR 已经死透, 模型根本爬不出 Phase 1 找到的局部解。Phase 3 同理。
-      EPOCHS=18000 时这个问题被掩盖 (Phase 1 才 6000 epoch, LR 来不及
-      死透), 一拉长就暴露。
-
-    BUG 4: Phase 2/3 开头从 Phase 1 末态出发
-      旧版本 phase 切换时: 模型继续从上一 phase 最后一步的状态开始。
-      但 Phase 1 末态可能是个 reconstruction-only 摊平的烂解, 比 Phase 1
-      早期 silhouette 0.5674 的状态差得多。从烂解出发, Phase 2 的
-      diversity/spread 即使 LR 充足也很难恢复。
-
-  ── 修复 ────────────────────────────────────────────────────────────────
-
-    FIX 1: 早停在所有 phase 都能触发, 但语义分两种
-      * Phase 1/2: patience 超阈值 → 推进到下一 phase (而不是终止)
-      * Phase 3: patience 超阈值 → 终止整个训练
-      用户原本的用法 ("loss 不动就退出") 在 Phase 3 完全保留;
-      Phase 1/2 升级为更聪明的 "loss 不动就快进", 不浪费 epoch。
-
-    FIX 2: patience 改成 loss-based + silhouette-based 双触发清零
-      * 每步 patience += 1
-      * 当前 loss 低于 phase 内历史最低 → patience = 0
-      * silhouette 高于全局历史最高 → patience = 0
-      用户 "loss 不怎么动就停" 的直觉直接落实成代码。
-
-    FIX 3: 每个 phase 开头重置 LR + 重建 scheduler
-      * lr 拉回 args.lr (Phase 2/3 也有完整 LR 预算)
-      * scheduler 重建: 全新的 plateau patience 计数从 0 开始
-      防止 Phase 1 把 LR 砍光后留给 Phase 2/3 一个死局。
-
-    FIX 4: Phase 2/3 开头 restore best_state
-      从已知最好的 silhouette 点出发, 而不是从 Phase 1 末态烂解出发。
-      DDP 模式下 rank 0 加载 + broadcast 到其他 rank。
-
-  ── 行为差异 (相对 v1.3) ────────────────────────────────────────────────
-    * CLI 完全兼容, 无新参数
-    * --early_stop_patience 默认 500, 含义: "phase 内连续 X epoch
-      loss/silhouette 都不改善就推进 phase / 终止"
-    * EPOCHS=100000 现在是合理的 "上限", 实际训练通常在每个 phase
-      跑 1000-3000 epoch 就推进, 总用时大幅缩短
-    * EPOCHS=18000 (v1.2 默认) 行为变化不大: Phase 1 该早完早完, Phase 3
-      早停准确触发
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  阶段 0: 早期解析 (必须在 import torch 之前)
+#  阶段 0: 早期解析
 # ═══════════════════════════════════════════════════════════════════════════
 import os
 import sys
@@ -177,7 +97,7 @@ for _var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
 os.environ.setdefault('MKL_DYNAMIC', 'FALSE')
 os.environ.setdefault('OMP_DYNAMIC', 'FALSE')
 os.environ.setdefault('MKL_DEBUG_CPU_TYPE', '5')
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
+if not torch.cuda.is_available(): os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  阶段 1: 正常 imports
