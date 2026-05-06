@@ -181,31 +181,33 @@ def feature_dim(encoding: str, min_kmer: int, max_kmer: int, fft_size: int) -> i
 
 def read_block_file(path: str):
     """
-    Parse a block .txt file (tab-separated, with header).
-
-    Expected format:
-        Start  \\t  End  \\t  Bloodline
-        0      \\t  1000000  \\t  Officinarum
-        ...
-
-    Yields (start:int, end:int, bloodline:str) tuples.
+    Parse a block .txt file (whitespace-separated, with header).
+    Auto-detects 3-column vs 4-column format from header.
     """
     with open(path) as fh:
-        header = fh.readline()  # skip header line
+        header = fh.readline()
+        header_parts = header.strip().split()
+        has_chrom_col = (len(header_parts) >= 4)
+
         for lineno, line in enumerate(fh, start=2):
             line = line.rstrip('\n')
             if not line:
                 continue
-            parts = line.split('\t')
-            if len(parts) < 3:
-                print(f"  [WARN] {path}:{lineno}: expected 3 columns, got {len(parts)}, skipping")
+            parts = line.split()          # ← 用 split() 代替 split('\t')，兼容空格/tab 混排
+            min_cols = 4 if has_chrom_col else 3
+            if len(parts) < min_cols:
+                print(f"  [WARN] {path}:{lineno}: expected {min_cols} columns, got {len(parts)}, skipping")
                 continue
             try:
-                start, end = int(parts[0]), int(parts[1])
+                if has_chrom_col:
+                    start, end = int(parts[1]), int(parts[2])
+                    bloodline = parts[3].strip()
+                else:
+                    start, end = int(parts[0]), int(parts[1])
+                    bloodline = parts[2].strip()
             except ValueError:
                 print(f"  [WARN] {path}:{lineno}: non-integer start/end, skipping")
                 continue
-            bloodline = parts[2].strip()
             yield start, end, bloodline
 
 
